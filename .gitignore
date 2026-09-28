@@ -1,0 +1,24 @@
+# IDE / OS
+# Python
+# Runtime data
+# Secrets — never commit real credentials
+*.egg-info/
+*.key
+*.log
+*.pem
+*.py[cod]
+*.pyc
+.DS_Store
+.env
+.idea/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.vscode/
+__pycache__/
+data/
+node_modules/
+server.log
+vector_store/
+venv/

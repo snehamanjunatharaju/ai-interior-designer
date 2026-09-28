@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InteriorAI — Agentic Interior Design Platform</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127968;</text></svg>">
+</head>
+<body>
+<header class="site-header">
+    <div class="header-inner">
+        <div class="brand">
+            <span class="brand-mark">&#9670;</span>
+            <div>
+                <h1>InteriorAI</h1>
+                <p>Agentic interior design for the Indian market</p>
+            </div>
+        </div>
+        <div class="header-badges">
+            <span class="badge" id="providerBadge">checking&hellip;</span>
+            <span class="badge" id="healthBadge">&mdash;</span>
+        </div>
+    </div>
+</header>
+
+<main class="container">
+    <section class="panel">
+        <h2>Design Brief</h2>
+        <form id="designForm">
+            <div class="grid">
+                <div class="field">
+                    <label for="room_type">Room Type</label>
+                    <select id="room_type" name="room_type">
+                        <option value="living_room">Living Room</option>
+                        <option value="bedroom">Bedroom</option>
+                        <option value="kitchen">Kitchen</option>
+                        <option value="home_office">Home Office</option>
+                        <option value="dining">Dining</option>
+                        <option value="kids_room">Kids Room</option>
+                        <option value="balcony">Balcony</option>
+                        <option value="foyer">Entrance Foyer</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="style">Design Style</label>
+                    <select id="style" name="style">
+                        <option value="modern">Modern</option>
+                        <option value="minimalist">Minimalist</option>
+                        <option value="scandinavian">Scandinavian</option>
+                        <option value="industrial">Industrial</option>
+                        <option value="bohemian">Bohemian</option>
+                        <option value="japanese">Japanese</option>
+                        <option value="midcentury">Mid-Century</option>
+                        <option value="traditional_indian">Traditional Indian</option>
+                        <option value="luxury">Luxury</option>
+                        <option value="cozy">Cozy</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="budget">Budget Tier</label>
+                    <select id="budget" name="budget">
+                        <option value="low">Low &mdash; under &#8377;1L</option>
+                        <option value="medium" selected>Medium &mdash; &#8377;1L to &#8377;5L</option>
+                        <option value="high">High &mdash; &#8377;5L to &#8377;15L</option>
+                        <option value="luxury">Luxury &mdash; &#8377;15L+</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="color_scheme">Colour Scheme</label>
+                    <select id="color_scheme" name="color_scheme">
+                        <option value="neutral">Neutral Tones</option>
+                        <option value="warm">Warm Earthy</option>
+                        <option value="pastel">Soft Pastels</option>
+                        <option value="monochrome">Monochrome</option>
+                        <option value="vibrant">Vibrant</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="room_dimensions">Room Dimensions <span class="hint">optional</span></label>
+                    <input type="text" id="room_dimensions" name="room_dimensions"
+                           placeholder="e.g. 12ft x 10ft, ceiling 9ft">
+                </div>
+
+                <div class="field">
+                    <label for="num_options">Number of Options</label>
+                    <select id="num_options" name="num_options">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3" selected>3</option>
+                        <option value="4">4</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="vastu_compliance">Vastu Compliance</label>
+                    <select id="vastu_compliance" name="vastu_compliance">
+                        <option value="ignore">Ignore</option>
+                        <option value="soft" selected>Soft</option>
+                        <option value="strict">Strict</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="budget_amount_inr">Exact Budget <span class="hint">optional, &#8377;</span></label>
+                    <input type="number" id="budget_amount_inr" name="budget_amount_inr"
+                           min="1000" step="1000" placeholder="e.g. 500000">
+                </div>
+            </div>
+
+            <div class="field">
+                <label for="client_preferences">Client Brief <span class="req">required</span></label>
+                <textarea id="client_preferences" name="client_preferences" rows="3" required
+                          placeholder="Describe the client's needs, lifestyle, and what matters to them..."></textarea>
+            </div>
+
+            <div class="field">
+                <label for="occupants">Occupants <span class="hint">comma separated</span></label>
+                <input type="text" id="occupants" name="occupants"
+                       placeholder="e.g. adults, one toddler, one teenager">
+            </div>
+
+            <div class="field">
+                <label>Furniture Needed</label>
+                <div class="chips" id="furnitureChips">
+                    <label class="chip"><input type="checkbox" value="sofa"><span>Sofa</span></label>
+                    <label class="chip"><input type="checkbox" value="armchair"><span>Armchair</span></label>
+                    <label class="chip"><input type="checkbox" value="coffee_table"><span>Coffee Table</span></label>
+                    <label class="chip"><input type="checkbox" value="tv_unit"><span>TV Unit</span></label>
+                    <label class="chip"><input type="checkbox" value="dining_table"><span>Dining Table</span></label>
+                    <label class="chip"><input type="checkbox" value="bed"><span>Bed</span></label>
+                    <label class="chip"><input type="checkbox" value="wardrobe"><span>Wardrobe</span></label>
+                    <label class="chip"><input type="checkbox" value="study_desk"><span>Study Desk</span></label>
+                    <label class="chip"><input type="checkbox" value="bookshelf"><span>Bookshelf</span></label>
+                    <label class="chip"><input type="checkbox" value="shoe_rack"><span>Shoe Rack</span></label>
+                </div>
+            </div>
+
+            <div class="field">
+                <label>Special Requirements</label>
+                <div class="chips" id="requirementChips">
+                    <label class="chip"><input type="checkbox" value="reading_nook"><span>Reading Nook</span></label>
+                    <label class="chip"><input type="checkbox" value="work_from_home"><span>Work From Home</span></label>
+                    <label class="chip"><input type="checkbox" value="kids_safe"><span>Kids Safe</span></label>
+                    <label class="chip"><input type="checkbox" value="storage_heavy"><span>Heavy Storage</span></label>
+                    <label class="chip"><input type="checkbox" value="low_maintenance"><span>Low Maintenance</span></label>
+                    <label class="chip"><input type="checkbox" value="entertainment"><span>Entertainment</span></label>
+                    <label class="chip"><input type="checkbox" value="natural_light"><span>Natural Light</span></label>
+                    <label class="chip"><input type="checkbox" value="pet_friendly"><span>Pet Friendly</span></label>
+                </div>
+            </div>
+
+            <div class="field">
+                <label for="lifestyle_notes">Lifestyle Notes <span class="hint">optional</span></label>
+                <textarea id="lifestyle_notes" name="lifestyle_notes" rows="2"
+                          placeholder="e.g. vegetarian cooking, works from home 3 days/week, plants die easily"></textarea>
+            </div>
+
+            <div class="form-footer">
+                <label class="toggle">
+                    <input type="checkbox" id="use_cache" checked>
+                    <span>Use semantic cache</span>
+                </label>
+                <button type="submit" class="btn-primary" id="generateBtn">
+                    <span class="btn-text">Generate Designs</span>
+                    <span class="spinner" hidden></span>
+                </button>
+            </div>
+        </form>
+    </section>
+
+    <section class="panel" id="pipelinePanel" hidden>
+        <h2>Agent Pipeline <span class="hint" id="pipelineTimer"></span></h2>
+        <div id="pipeline" class="pipeline"></div>
+    </section>
+
+    <section class="panel" id="resultsPanel" hidden>
+        <div class="results-header">
+            <h2>Design Options</h2>
+            <div class="results-meta" id="resultsMeta"></div>
+        </div>
+        <div class="evaluation" id="evaluation" hidden></div>
+        <div id="results" class="results"></div>
+    </section>
+
+    <section class="panel" id="sourcesPanel" hidden>
+        <h2>Retrieved Knowledge <span class="hint">grounding sources</span></h2>
+        <div id="sources" class="sources"></div>
+    </section>
+</main>
+
+<footer class="site-footer">
+    <p>InteriorAI &mdash; multi-agent LLM pipeline &middot; RAG &middot; semantic caching &middot; full observability</p>
+    <p class="footer-sub">Built with FastAPI, Ollama / OpenAI / Anthropic, NumPy vector search</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
