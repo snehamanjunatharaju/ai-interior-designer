@@ -84,6 +84,36 @@
                     <label for="room_dimensions">Room Dimensions <span class="hint">optional</span></label>
                     <input type="text" id="room_dimensions" name="room_dimensions"
                            placeholder="e.g. 12ft x 10ft, ceiling 9ft">
+                    <div class="field-row">
+                        <div>
+                            <label for="door_direction">Door faces <span class="hint">optional</span></label>
+                            <select id="door_direction" name="door_direction">
+                                <option value="">Not specified</option>
+                                <option value="north">North</option>
+                                <option value="south">South</option>
+                                <option value="east">East</option>
+                                <option value="west">West</option>
+                                <option value="northeast">North-east</option>
+                                <option value="southeast">South-east</option>
+                                <option value="northwest">North-west</option>
+                                <option value="southwest">South-west</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="window_direction">Window faces <span class="hint">optional</span></label>
+                            <select id="window_direction" name="window_direction">
+                                <option value="">Not specified</option>
+                                <option value="north">North</option>
+                                <option value="south">South</option>
+                                <option value="east">East</option>
+                                <option value="west">West</option>
+                                <option value="northeast">North-east</option>
+                                <option value="southeast">South-east</option>
+                                <option value="northwest">North-west</option>
+                                <option value="southwest">South-west</option>
+                            </select>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="field">
@@ -178,12 +208,56 @@
         <div id="pipeline" class="pipeline"></div>
     </section>
 
+    <section class="panel" id="layoutPanel" hidden>
+        <div class="results-header">
+            <h2>Floor Plan <span class="hint">real dimensions, computed in code</span></h2>
+            <div class="results-meta" id="layoutMeta"></div>
+        </div>
+        <div class="layout-wrap">
+            <div class="plan-tabs">
+                <div class="tabbar" role="tablist">
+                    <button class="tab active" data-view="2d" role="tab" type="button">2D plan</button>
+                    <button class="tab" data-view="3d" role="tab" type="button">3D view</button>
+                </div>
+                <div id="plan" class="plan"></div>
+                <div id="plan3d" class="plan plan3d" hidden></div>
+            </div>
+            <aside class="plan-side">
+                <div id="planLegend" class="plan-legend"></div>
+                <div id="planIssues" class="plan-issues"></div>
+            </aside>
+        </div>
+    </section>
+
+    <section class="panel" id="vastuPanel" hidden>
+        <div class="results-header">
+            <h2>Vastu assessment <span class="hint">rule-based, checked in code</span></h2>
+            <div class="results-meta" id="vastuMeta"></div>
+        </div>
+        <div id="vastuBody"></div>
+    </section>
+
+    <section class="panel" id="refinePanel" hidden>
+        <h2>Change anything <span class="hint">only the part you name is updated</span></h2>
+        <div class="refine-row">
+            <input type="text" id="refineInput" placeholder="Make the desk bigger" autocomplete="off">
+            <button class="btn-primary" id="refineBtn" type="button">Update design</button>
+        </div>
+        <div class="refine-suggestions" id="refineSuggestions"></div>
+        <div id="refineResult" class="refine-result"></div>
+    </section>
+
     <section class="panel" id="resultsPanel" hidden>
         <div class="results-header">
             <h2>Design Options</h2>
             <div class="results-meta" id="resultsMeta"></div>
         </div>
+        <div class="evaluation" id="budgetPlan" hidden></div>
+        <div class="evaluation" id="validation" hidden></div>
         <div class="evaluation" id="evaluation" hidden></div>
+        <div class="download-row">
+            <button class="btn-secondary" id="pdfBtn" type="button">Download client proposal (PDF)</button>
+        </div>
         <div id="results" class="results"></div>
     </section>
 
@@ -198,6 +272,9 @@
     <p class="footer-sub">Built with FastAPI, Ollama / OpenAI / Anthropic, NumPy vector search</p>
 </footer>
 
+<script src="/static/vendor/three.min.js"></script>
+<script src="/static/layout.js"></script>
+<script src="/static/layout3d.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

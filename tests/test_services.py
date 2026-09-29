@@ -284,6 +284,73 @@ class TestBudgetAgent:
         # 20000 + (5000 * 2)
         assert out["estimated_cost_inr"] == 30_000
 
+    def test_unpriced_is_flagged_not_treated_as_free(self, agent, sample_request):
+        """
+        Regression: a zero total previously reported 'within budget',
+        making a completely unpriced design look like a success.
+        """
+        design = {"furniture": []}
+        out = agent._reconcile({}, design, sample_request, 100_000)
+        assert out["costing_complete"] is False
+        assert out["within_budget"] is False
+        assert out["estimated_cost_inr"] == 0
+        assert out["cost_savings"], "an unpriced design must explain itself"
+
+
+class TestSafeTextCoercion:
+    """
+    Regression: `slice(None, 800, None)` crashed the pipeline whenever the
+    model returned null for a field. Every prompt interpolation must coerce.
+    """
+
+    def test_none_becomes_empty_string(self):
+        from app.agents.orchestrator import _text
+
+        assert _text(None) == ""
+        assert _text(None, 800) == ""
+
+    def test_numbers_and_booleans(self):
+        from app.agents.orchestrator import _text
+
+        assert _text(42) == "42"
+        assert _text(True) == "True"
+
+    def test_dicts_are_serialised(self):
+        import json
+
+        from app.agents.orchestrator import _text
+
+        assert json.loads(_text({"a": 1})) == {"a": 1}
+
+    def test_truncation_still_applies(self):
+        from app.agents.orchestrator import _text
+
+        assert _text("x" * 100, 10) == "x" * 10
+
+    @pytest.mark.asyncio
+    async def test_budget_agent_survives_null_fields(self, sample_request):
+        """The exact crash reported in production: null design fields."""
+        from app.agents.orchestrator import BudgetAgent, _text
+
+        agent = BudgetAgent()
+        design = {
+            "title": None,
+            "layout_description": None,
+            "lighting_plan": None,
+            "storage_strategy": None,
+            "furniture": [],
+        }
+        # Replicate the prompt interpolation that used to raise TypeError.
+        prompt = (
+            f"Title: {_text(design.get('title'))}\n"
+            f"Layout: {_text(design.get('layout_description'), 800)}\n"
+            f"Lighting: {_text(design.get('lighting_plan'), 300)}"
+        )
+        assert "None" not in prompt
+
+        out = agent._reconcile({}, design, sample_request, 100_000)
+        assert out["costing_complete"] is False
+
 
 class TestCriticAgent:
     @pytest.fixture
@@ -346,12 +413,65 @@ class TestDesignPipelineHelpers:
         assert option.furniture[0].estimated_price_inr == 0
         assert option.furniture[0].quantity == 1
 
-    def test_to_option_estimates_cost_from_furniture(self, pipeline, sample_request):
+    def test_to_option_ignores_model_supplied_price(self, pipeline, sample_request):
+        """
+        Prices come from the catalog, never from the model.
+
+        This test previously asserted the opposite - that an invented
+        `estimated_price_inr` was accepted and multiplied by quantity, which
+        is the "Rs 0 / hallucinated total" bug. A design whose furniture has
+        no catalog SKU is unpriced, and the option must report 0 rather than
+        echoing a number the model made up.
+        """
         design = {
             "title": "T",
             "furniture": [{"name": "Sofa", "estimated_price_inr": 10000, "quantity": 2}],
         }
-        assert pipeline._to_option(design, sample_request).estimated_cost_inr == 20_000
+        assert pipeline._to_option(design, sample_request).estimated_cost_inr == 0
+
+    def test_to_option_prices_from_catalog(self, pipeline, sample_request):
+        """A real SKU is priced from the database, ignoring the model's number."""
+        design = {
+            "title": "T",
+            "furniture": [{
+                "name": "Sofa", "sku": "SOF-2S-01", "category": "sofa",
+                "estimated_price_inr": 1, "quantity": 2,
+            }],
+        }
+        option = pipeline._to_option(design, sample_request)
+        assert option.estimated_cost_inr == 37_000  # 18,500 x 2
+        assert option.furniture[0].sku == "SOF-2S-01"
+        assert option.furniture[0].url
+
+    def test_to_option_line_totals_match_unit_times_quantity(self, pipeline):
+        """
+        Every published line must satisfy line = unit x qty.
+
+        A bunk bed once reached the client as quantity 2 at a unit price for
+        one, because quantities were repaired after pricing. The regression
+        is a bunk bed for a two-bed brief, since that is the case where
+        quantity repair actually fires.
+        """
+        from app.core.schemas import DesignRequest
+
+        request = DesignRequest(
+            client_preferences="A kids room for two children",
+            room_type="kids_room",
+            color_scheme="vibrant",
+            budget_amount_inr=10_000,
+        )
+        design = {
+            "title": "Bunk Smart",
+            "furniture": [{
+                "name": "Kids Bunk Bed", "sku": "BED-KID-BUNK-01",
+                "category": "bed", "quantity": 1,
+            }],
+        }
+        option = pipeline._to_option(design, request)
+        bunk = option.furniture[0]
+        assert bunk.quantity == 1, "one bunk sleeps two; it must not be doubled"
+        assert bunk.line_total_inr == bunk.unit_price_inr * bunk.quantity
+        assert option.estimated_cost_inr == 14_500
 
     def test_to_option_empty_design(self, pipeline, sample_request):
         option = pipeline._to_option({}, sample_request)

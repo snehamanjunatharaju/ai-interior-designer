@@ -78,6 +78,15 @@ class DesignRequest(BaseModel):
     room_dimensions: Optional[str] = Field(
         default=None, description='e.g. "12ft x 10ft, ceiling 9ft"'
     )
+    # Optional compass inputs. Free-text directions inside the brief are
+    # still parsed, but an explicit field is authoritative and avoids the
+    # ambiguity of "the window faces the morning light".
+    door_direction: Optional[str] = Field(
+        default=None, description="Compass direction the main door opens toward"
+    )
+    window_direction: Optional[str] = Field(
+        default=None, description="Compass direction the main window faces"
+    )
     num_options: int = Field(default=3, ge=1, le=8)
     include_details: bool = True
     furniture: List[str] = Field(default_factory=list)
@@ -113,11 +122,26 @@ class RetrievalRequest(BaseModel):
 
 
 class FurnitureItem(BaseModel):
+    """
+    One line item.
+
+    `sku` links back to the catalog row, which is where the price and brand
+    actually come from. `estimated_price_inr` is populated by code after
+    pricing; the LLM never sets it.
+    """
+
     name: str
     category: str = ""
     brand_suggestions: List[str] = Field(default_factory=list)
     estimated_price_inr: int = 0
     quantity: int = 1
+    sku: Optional[str] = None
+    unit_price_inr: int = 0
+    line_total_inr: int = 0
+    url: Optional[str] = None
+    width_cm: int = 0
+    depth_cm: int = 0
+    height_cm: int = 0
 
 
 class ColorPalette(BaseModel):
@@ -186,6 +210,21 @@ class DesignResponse(BaseModel):
     model_used: str = ""
     cached: bool = False
     evaluation: Optional[Dict[str, Any]] = None
+
+    # --- added by the deterministic engine ---
+    # Deterministic brief check: violations list, pass rate, check counts.
+    validation: Optional[Dict[str, Any]] = None
+    # Code-computed costing, with per-line catalog provenance.
+    cost_breakdown: Optional[Dict[str, Any]] = None
+    # Essentials/upgrade split when the budget cannot cover the wish list.
+    budget_plan: Optional[Dict[str, Any]] = None
+    # What the parser understood the client to be asking for.
+    brief_constraints: Optional[Dict[str, Any]] = None
+
+    # True when the pipeline exhausted its rewrite attempts and is returning
+    # the best attempt anyway, still failing its brief checks. The UI must
+    # show this rather than presenting an unchecked design as final.
+    partial: bool = False
 
 
 class EvaluationScore(BaseModel):

@@ -559,3 +559,192 @@ table.furniture .num { text-align: right; font-family: var(--mono); color: var(-
     .bd-row { grid-template-columns: 120px 1fr 68px; }
     .option-price { text-align: left; }
 }
+
+/* --------------------------------------------------------------------------
+   Deterministic engine panels (validation, phased budget plan)
+   Added with the catalog/validator work. The existing form and result
+   styling above is unchanged.
+   -------------------------------------------------------------------------- */
+
+.verdict {
+    float: right;
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+}
+.verdict.pass { background: rgba(34, 197, 94, 0.15); color: #15803d; }
+.verdict.fail { background: rgba(220, 38, 38, 0.15); color: #b91c1c; }
+
+ul.checks { list-style: none; margin: 0.6rem 0 0; padding: 0; }
+
+.vcheck {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.07));
+    font-size: 0.92rem;
+    line-height: 1.4;
+}
+.vcheck:last-child { border-bottom: none; }
+.vcheck .mark { flex: 0 0 1.1rem; font-weight: 700; }
+.vcheck.error .mark { color: #dc2626; }
+.vcheck.warning .mark { color: #d97706; }
+.vcheck.pass .mark { color: #16a34a; }
+
+.headline {
+    margin: 0.5rem 0 0.9rem;
+    padding: 0.6rem 0.75rem;
+    background: rgba(59, 130, 246, 0.07);
+    border-left: 3px solid #3b82f6;
+    border-radius: 0 4px 4px 0;
+    line-height: 1.5;
+}
+
+.phase-table { width: 100%; border-collapse: collapse; margin: 0.3rem 0; }
+.phase-table td { padding: 0.3rem 0; border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.07)); }
+.phase-table td.num, .phase-total .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.phase-total {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.45rem 0;
+    font-weight: 700;
+    border-top: 2px solid var(--border, rgba(0, 0, 0, 0.15));
+}
+
+.muted { color: #6b7280; }
+.small { font-size: 0.82rem; }
+
+/* ==========================================================================
+   Floor plan panel
+   ========================================================================== */
+
+.layout-wrap {
+    display: grid;
+    grid-template-columns: minmax(0, 1.55fr) minmax(190px, 0.85fr);
+    gap: 1.1rem;
+    align-items: start;
+}
+@media (max-width: 720px) {
+    .layout-wrap { grid-template-columns: 1fr; }
+}
+
+.plan {
+    background: #fff;
+    border: 1px solid var(--border, rgba(0, 0, 0, 0.09));
+    border-radius: 10px;
+    padding: 0.85rem;
+}
+.plan-svg { touch-action: none; }
+
+.plan-item { cursor: default; }
+.plan-item rect { transition: filter 0.12s ease; }
+.plan-item:hover rect { filter: brightness(0.96) saturate(1.15); }
+.plan-item:focus { outline: none; }
+.plan-item:focus rect { stroke: #2563eb; stroke-width: 3.5; }
+
+.plan-side { display: flex; flex-direction: column; gap: 0.7rem; }
+
+.plan-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.55rem; }
+.legend-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.32rem;
+    font-size: 0.75rem;
+    color: #4b5563;
+    text-transform: capitalize;
+}
+.legend-chip i {
+    width: 12px; height: 12px;
+    border: 1.5px solid; border-radius: 3px;
+    display: inline-block;
+}
+
+.plan-issues { display: flex; flex-direction: column; gap: 0.32rem; }
+.plan-issue {
+    font-size: 0.8rem;
+    line-height: 1.4;
+    padding: 0.38rem 0.5rem;
+    border-radius: 5px;
+    background: #f9fafb;
+    border-left: 3px solid #9ca3af;
+}
+.plan-issue.error { background: #fef2f2; border-left-color: #dc2626; }
+.plan-issue.warning { background: #fffbeb; border-left-color: #d97706; }
+.plan-issue .mark { font-weight: 700; margin-right: 0.2rem; }
+
+.chip {
+    display: inline-block;
+    padding: 0.14rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: #f3f4f6;
+    color: #4b5563;
+}
+.chip.good { background: #ecfdf5; color: #047857; }
+.chip.warn { background: #fffbeb; color: #b45309; }
+.chip.bad  { background: #fef2f2; color: #b91c1c; }
+
+/* Two optional fields side by side, matching the existing .field styling. */
+.field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+    margin-top: 0.55rem;
+}
+@media (max-width: 560px) { .field-row { grid-template-columns: 1fr; } }
+.field-row > div { display: flex; flex-direction: column; gap: 0.22rem; }
+
+/* ==========================================================================
+   Vastu, 3D view, refinement, and PDF controls
+   ========================================================================== */
+
+.vastu-rule {
+    display: flex; gap: 0.55rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--border, rgba(0,0,0,0.07));
+}
+.vastu-rule:last-child { border-bottom: none; }
+.vastu-rule .mark { flex: 0 0 1.1rem; font-weight: 700; }
+.vastu-rule.pass .mark { color: #16a34a; }
+.vastu-rule.error .mark { color: #dc2626; }
+.vastu-rule.warning .mark { color: #d97706; }
+.vastu-rule p { margin: 0.15rem 0 0; font-size: 0.88rem; line-height: 1.45; color: #4b5563; }
+.vastu-rule .remedy { color: #b45309; font-size: 0.83rem; }
+
+.plan-tabs { display: flex; flex-direction: column; gap: 0.5rem; }
+.tabbar { display: inline-flex; gap: 0.25rem; background: #f3f4f6; padding: 0.2rem; border-radius: 7px; align-self: flex-start; }
+.tab {
+    border: none; background: transparent; cursor: pointer;
+    padding: 0.3rem 0.75rem; border-radius: 5px;
+    font-size: 0.85rem; font-weight: 600; color: #6b7280;
+}
+.tab.active { background: #fff; color: #111827; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+.tab:hover:not(.active) { color: #374151; }
+
+.plan3d { min-height: 380px; display: flex; flex-direction: column; }
+.plan3d-canvas { width: 100%; height: 340px; display: block; border-radius: 6px; touch-action: none; cursor: grab; }
+.plan3d-canvas:active { cursor: grabbing; }
+.plan3d-hint { margin: 0.5rem 0 0; text-align: center; }
+
+.refine-row { display: flex; gap: 0.5rem; align-items: stretch; }
+.refine-row input { flex: 1; }
+.refine-suggestions { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.55rem; }
+.chip.suggest { cursor: pointer; background: #eef2ff; color: #3730a3; border: none; font-family: inherit; }
+.chip.suggest:hover { background: #e0e7ff; }
+
+.refine-result { margin-top: 0.7rem; font-size: 0.9rem; }
+.refine-ok { color: #047857; font-weight: 600; margin: 0 0 0.2rem; }
+
+.download-row { margin-top: 1rem; }
+.btn-secondary {
+    background: #fff; color: #374151;
+    border: 1px solid #d1d5db; border-radius: 7px;
+    padding: 0.5rem 0.9rem; font-size: 0.88rem; font-weight: 600;
+    cursor: pointer; font-family: inherit;
+}
+.btn-secondary:hover:not(:disabled) { background: #f9fafb; border-color: #9ca3af; }
+.btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }

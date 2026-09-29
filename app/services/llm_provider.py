@@ -479,8 +479,106 @@ class LLMRegistry:
         return status
 
 
+def _repair_json(text: str) -> Any:
+    """
+    Recover a usable object from truncated or malformed JSON.
+
+    Small local models frequently hit the token ceiling mid-document, which
+    leaves an unterminated string/object. Rather than discarding the whole
+    response, close the open structures and drop the incomplete tail. The
+    salvage is worth more than a total failure: a design missing its last
+    field is still a design.
+    """
+    # Walk the text tracking string state and open brackets.
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    last_complete = 0
+
+    for i, ch in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+                last_complete = i + 1
+        elif ch == "," and stack:
+            # A comma outside a string at depth>0 means the preceding value
+            # completed cleanly; a safe truncation point.
+            last_complete = i
+
+    if not stack:
+        return None
+
+    # Prefer the safe cut point (a completed key/value pair). Only if that
+    # yields nothing do we close a dangling string - appending a quote next
+    # to a bare number (e.g. `5000` -> `5000"`) creates invalid JSON.
+    candidates = []
+    safe = text[:last_complete].rstrip().rstrip(",")
+    if safe.strip():
+        candidates.append(safe)
+    if in_string:
+        # Close the string at the last delimiter that was not inside it.
+        candidates.append(text.rstrip().rstrip(",") + '"')
+
+    for base in candidates:
+        if not base.strip():
+            continue
+        for depth_trim in range(0, 40):
+            attempt = base[: len(base) - depth_trim].rstrip().rstrip(",") if depth_trim else base
+            if not attempt.strip():
+                break
+            # Recompute the open-bracket stack for this prefix.
+            open_stack = _open_brackets(attempt)
+            if open_stack is None:
+                break
+            attempt += "".join("}" if c == "{" else "]" for c in reversed(open_stack))
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _open_brackets(text: str) -> Optional[List[str]]:
+    """Return the unclosed bracket stack for `text`, or None if unbalanced."""
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                return None  # closing without an opener
+            stack.pop()
+    return stack
+
+
 def extract_json(text: str) -> Any:
-    """Best-effort JSON extraction from LLM output."""
+    """Best-effort JSON extraction and repair from LLM output."""
     if not text:
         raise ValueError("empty LLM response")
     try:
@@ -501,15 +599,28 @@ def extract_json(text: str) -> Any:
     except json.JSONDecodeError:
         pass
 
-    # Fall back to the outermost brace/bracket span.
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = cleaned.find(opener)
+    # Fall back to the outermost span. The opener must be the first
+    # structural character in the document, otherwise a nested array could
+    # be mistaken for the whole payload.
+    first_struct = min(
+        (i for i in (cleaned.find("{"), cleaned.find("[")) if i != -1),
+        default=-1,
+    )
+    if first_struct != -1:
+        opener = cleaned[first_struct]
+        closer = "}" if opener == "{" else "]"
         end = cleaned.rfind(closer)
-        if start != -1 and end > start:
+        if end > first_struct:
             try:
-                return json.loads(cleaned[start : end + 1])
+                return json.loads(cleaned[first_struct : end + 1])
             except json.JSONDecodeError:
-                continue
+                pass
+
+    # Salvage a truncated document.
+    repaired = _repair_json(cleaned)
+    if repaired is not None:
+        logger.info("json_repaired truncated_output_recovered")
+        return repaired
 
     raise ValueError(f"could not parse JSON from: {text[:200]}")
 

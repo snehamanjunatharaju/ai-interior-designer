@@ -94,7 +94,11 @@ class Settings:
     ANTHROPIC_MODEL: str = _env("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
 
     # --- Generation controls ---
-    MAX_TOKENS: int = _env_int("MAX_TOKENS", 2048)
+    # Ollama's `num_predict`. gemma2:2b tends to ramble; the agent prompts ask
+    # for large JSON documents, and too low a ceiling truncates output
+    # mid-object, which is unrecoverable. 3072 leaves headroom for the largest
+    # agent payload while still bounding the request.
+    MAX_TOKENS: int = _env_int("MAX_TOKENS", 3072)
     TEMPERATURE: float = _env_float("TEMPERATURE", 0.7)
     REQUEST_TIMEOUT: float = _env_float("REQUEST_TIMEOUT", 120.0)
     MAX_REFLECTION_ROUNDS: int = _env_int("MAX_REFLECTION_ROUNDS", 2)

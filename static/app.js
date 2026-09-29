@@ -50,6 +50,14 @@
         const dims = $("room_dimensions").value.trim();
         if (dims) payload.room_dimensions = dims;
 
+        // Directions feed both the layout engine (door swing, window band)
+        // and the Vastu rules. Sent as explicit fields so they are
+        // authoritative rather than inferred from prose.
+        const door = $("door_direction") && $("door_direction").value;
+        if (door) payload.door_direction = door;
+        const win = $("window_direction") && $("window_direction").value;
+        if (win) payload.window_direction = win;
+
         const occ = $("occupants").value.trim();
         if (occ) {
             payload.occupants = occ.split(",").map((s) => s.trim()).filter(Boolean);
@@ -85,6 +93,22 @@
         $("resultsPanel").hidden = true;
         $("evaluation").hidden = true;
         $("sources").innerHTML = "";
+        const vb = $("validation"); if (vb) { vb.hidden = true; vb.innerHTML = ""; }
+        const bpb = $("budgetPlan"); if (bpb) { bpb.hidden = true; bpb.innerHTML = ""; }
+        // Hiding, not clearing: emptying the panel destroys the child nodes
+        // the renderers write into, and the next render then has nowhere to
+        // put its output.
+        const vp = $("vastuPanel"); if (vp) { vp.hidden = true; }
+        const rp = $("refinePanel"); if (rp) { rp.hidden = true; }
+        const p3 = $("plan3d"); if (p3) { p3.innerHTML = ""; delete p3.dataset.drawn; }
+        // A new brief invalidates everything derived from the last one, so
+        // refine and PDF can never act on a stale design.
+        currentDesign = null;
+        currentLayout = null;
+        currentVastu = null;
+        currentCost = null;
+        currentBudgetPlan = null;
+        lastValidation = null;
         $("sourcesPanel").hidden = true;
     }
 
@@ -122,6 +146,371 @@
     }
 
     // ------------------------------------------------------------ rendering
+
+    async function renderLayout(payload) {
+        // The plan is a pure function of the brief and the catalog, so it
+        // needs no LLM call and can be drawn before the design finishes.
+        const panel = $("layoutPanel");
+        if (!panel) return;
+        try {
+            const res = await fetch("/api/v1/layout", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                panel.hidden = true;
+                $("layoutMeta").textContent = err.detail || "No plan available.";
+                return;
+            }
+            const plan = await res.json();
+            panel.hidden = false;
+            currentLayout = plan;
+            wireTabs();
+            LayoutView.render($("plan"), plan);
+
+            const cats = [...new Set((plan.items || []).map((i) => i.category))];
+            $("planLegend").innerHTML = "";
+            $("planLegend").appendChild(LayoutView.legend(cats));
+
+            const s = plan.score || {};
+            $("layoutMeta").innerHTML =
+                `<span class="chip ${s.errors ? "bad" : "good"}">${
+                    s.errors ? `${s.errors} conflict${s.errors > 1 ? "s" : ""}` : "No conflicts"
+                }</span>` +
+                (s.unplaced ? ` <span class="chip warn">${s.unplaced} unplaced</span>` : "") +
+                ` <span class="chip">score ${s.overall}</span>`;
+
+            const issues = (plan.issues || []).concat(
+                (plan.unplaced || []).map((u) => ({
+                    code: "unplaced", severity: "error",
+                    message: `${u.name} could not be placed - ${u.reason}.`,
+                }))
+            );
+            $("planIssues").innerHTML = issues.length
+                ? issues
+                      .map(
+                          (i) =>
+                              `<div class="plan-issue ${i.severity}"><span class="mark">${
+                                  i.severity === "error" ? "✕" : "!"
+                              }</span> ${esc(i.message)}</div>`
+                      )
+                      .join("")
+                : "";
+
+            // Vastu scores the measured layout, so it has to wait for this
+            // promise to resolve. Calling it alongside the request meant
+            // currentLayout was still null and the panel silently stayed
+            // hidden.
+            if (typeof renderVastu === "function") {
+                renderVastu(lastPayload || buildPayload());
+            }
+            // If the client is already looking at the 3D tab, draw it now
+            // that the layout exists.
+            if (typeof global.__draw3d === "function") global.__draw3d();
+        } catch (e) {
+            panel.hidden = true;
+        }
+    }
+
+    // Keeps the last design so refine and PDF act on exactly what is on screen.
+    let currentDesign = null;
+    let currentLayout = null;
+    let currentVastu = null;
+    let lastPayload = null;
+    let lastValidation = null;
+    let currentBudgetPlan = null;
+    let currentCost = null;
+
+    // ------------------------------------------------------- Vastu panel
+
+    async function renderVastu(payload) {
+        const panel = $("vastuPanel");
+        if (!panel || !currentLayout) { if (panel) panel.hidden = true; return; }
+        try {
+            const res = await fetch("/api/v1/vastu", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: currentLayout.items,
+                    room_type: payload.room_type,
+                    door_direction: payload.door_direction,
+                    window_direction: payload.window_direction,
+                    compliance: payload.vastu_compliance,
+                }),
+            });
+            if (!res.ok) { panel.hidden = true; return; }
+            const v = await res.json();
+            currentVastu = v;
+            panel.hidden = false;
+
+            $("vastuMeta").innerHTML =
+                `<span class="chip ${v.score >= 75 ? "good" : v.score >= 60 ? "warn" : "bad"}">` +
+                `${v.score} / 100</span> <span class="chip">${esc(v.grade)}</span>` +
+                ` <span class="chip">${v.passed} of ${v.total} rules</span>`;
+
+            const rows = (v.results || []).map((r) => {
+                const cls = r.passed ? "pass" : r.severity === "error" ? "error" : "warning";
+                const mark = r.passed ? "✓" : r.severity === "error" ? "✕" : "!";
+                return `<div class="vastu-rule ${cls}">
+                    <span class="mark">${mark}</span>
+                    <div>
+                        <strong>${esc(r.title)}</strong>
+                        <p>${esc(r.explanation)}</p>
+                        ${r.remedy ? `<p class="remedy">Fix: ${esc(r.remedy)}</p>` : ""}
+                    </div>
+                </div>`;
+            }).join("");
+
+            const notes = (v.notes || []).map((n) => `<p class="muted small">${esc(n)}</p>`).join("");
+            const missing = (v.missing_inputs || []).length
+                ? `<p class="muted small">Add ${esc(v.missing_inputs.join(" and ").replace(/_/g, " "))} for a fuller score.</p>`
+                : "";
+            $("vastuBody").innerHTML = rows + notes + missing;
+        } catch (e) {
+            panel.hidden = true;
+        }
+    }
+
+    // ---------------------------------------------------------- refinement
+
+    function renderRefine() {
+        const box = $("refinePanel");
+        if (!box) return;
+        box.hidden = false;
+        if (!$("refineSuggestions").dataset.filled) {
+            $("refineSuggestions").dataset.filled = "1";
+            $("refineSuggestions").innerHTML = [
+                "Make the desk bigger", "Swap the armchair for a bean bag",
+                "Make it bluer", "Add a reading nook", "Remove the rug",
+                "Move the wardrobe next to the door",
+            ].map((s) => `<button type="button" class="chip suggest">${esc(s)}</button>`).join("");
+            $("refineSuggestions").addEventListener("click", (e) => {
+                if (e.target.classList.contains("suggest")) {
+                    $("refineInput").value = e.target.textContent;
+                    $("refineBtn").click();
+                }
+            });
+        }
+    }
+
+    async function runRefine() {
+        const input = $("refineInput");
+        const text = input.value.trim();
+        const out = $("refineResult");
+        if (!text || !currentDesign) { if (out) out.innerHTML = ""; return; }
+        const btn = $("refineBtn");
+        if (btn) btn.disabled = true;
+        if (out) out.innerHTML = '<p class="muted small">Applying…</p>';
+        try {
+            const res = await fetch("/api/v1/refine", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    design: currentDesign,
+                    request: text,
+                    budget_inr: lastPayload ? lastPayload.budget_amount_inr : null,
+                }),
+            });
+            const data = await res.json();
+            if (!data.understood) {
+                if (out) out.innerHTML =
+                    `<p class="muted small">${esc(data.message || "Could not tell what to change.")}</p>`;
+                return;
+            }
+            currentDesign = data.design;
+            renderOptions([data.design]);
+            if (data.cost && data.cost.line_items) {
+                renderBudgetPlan(data.budget_plan);
+            }
+            if (out) {
+                const changed = (data.changed_fields || []).join(", ") || "nothing";
+                out.innerHTML =
+                    `<p class="refine-ok">Updated: <strong>${esc(changed)}</strong></p>` +
+                    `<p class="muted small">${esc(data.message)}</p>` +
+                    (data.cost ? `<p class="muted small">New total ${inr(data.cost.estimated_cost_inr)}</p>` : "");
+            }
+            input.value = "";
+        } catch (e) {
+            if (out) out.innerHTML = '<p class="muted small">Could not apply that change.</p>';
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    // ---------------------------------------------------------------- PDF
+
+    async function downloadPdf() {
+        if (!currentDesign) return;
+        const btn = $("pdfBtn");
+        if (btn) btn.disabled = true;
+        try {
+            const res = await fetch("/api/v1/proposal.pdf", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    design: currentDesign,
+                    cost: currentCost,
+                    layout: currentLayout,
+                    validation: lastValidation,
+                    vastu: currentVastu,
+                    budget_plan: currentBudgetPlan,
+                    client_name: "Client",
+                    room_type: lastPayload ? lastPayload.room_type : "",
+                }),
+            });
+            if (!res.ok) throw new Error("pdf failed");
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "interiorai-proposal.pdf";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            if (btn) btn.title = "Could not build the PDF.";
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    // Runs once a design has rendered, whichever transport delivered it.
+    function _afterResult(data, payload) {
+        lastValidation = data.validation || null;
+        currentBudgetPlan = data.budget_plan || null;
+        currentCost = data.cost_breakdown || null;
+        const first = (data.options || [])[0];
+        currentDesign = first ? _optionAsDesign(first, data) : null;
+        renderRefine();
+        // Vastu is kicked off from renderLayout, once the geometry it scores
+        // actually exists.
+    }
+
+    // The refine and PDF endpoints work on the raw design dict, so the option
+    // is flattened into the shape those endpoints expect.
+    function _optionAsDesign(option, data) {
+        const cost = data.cost_breakdown || {};
+        const bySku = {};
+        (cost.line_items || []).forEach((li) => { bySku[li.sku] = li; });
+        return {
+            title: option.title,
+            concept: option.concept,
+            layout_description: option.layout_description,
+            zones: option.zones,
+            lighting_plan: option.lighting_plan,
+            storage_strategy: option.storage_strategy,
+            decor_suggestions: option.decor_suggestions,
+            vastu_notes: option.vastu_notes,
+            pros: option.pros,
+            cons: option.cons,
+            color_palette: option.color_palette,
+            furniture: (option.furniture || []).map((f) => {
+                const line = bySku[f.sku] || {};
+                return {
+                    name: f.name,
+                    category: f.category,
+                    sku: f.sku,
+                    quantity: f.quantity,
+                    brand_suggestions: f.brand_suggestions || [line.brand].filter(Boolean),
+                };
+            }),
+        };
+    }
+
+    // ------------------------------------------------------- 2D/3D tab bar
+
+    function wireTabs() {
+        const bar = document.querySelector(".tabbar");
+        if (!bar || bar.dataset.wired) return;
+        bar.dataset.wired = "1";
+        const draw3d = () => {
+            const host = $("plan3d");
+            if (!host || host.dataset.drawn) return;
+            if (!currentLayout) return;      // nothing to draw yet
+            if (!global.Layout3D) return;
+            host.dataset.drawn = "1";
+            Layout3D.render(host, currentLayout);
+        };
+        bar.addEventListener("click", (e) => {
+            const btn = e.target.closest(".tab");
+            if (!btn) return;
+            bar.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+            btn.classList.add("active");
+            const is3d = btn.dataset.view === "3d";
+            $("plan").hidden = is3d;
+            $("plan3d").hidden = !is3d;
+            if (is3d) draw3d();
+        });
+        // Exposed so the layout fetch can draw the 3D view immediately when a
+        // client lands on the 3D tab, without waiting for another click.
+        global.__draw3d = draw3d;
+    }
+
+    async function renderValidation(validation) {
+        const box = $("validation");
+        if (!box) return;
+        if (!validation || !validation.checks_run) { box.hidden = true; return; }
+
+        const v = validation.violations || [];
+        const errors = v.filter((x) => x.severity === "error");
+        const warnings = v.filter((x) => x.severity === "warning");
+        const pass = errors.length === 0;
+
+        const items = v
+            .map(
+                (x) => `<li class="vcheck ${x.severity}">
+            <span class="mark">${x.severity === "error" ? "✕" : "!"}</span>
+            <span>${esc(x.message)}</span>
+        </li>`
+            )
+            .join("");
+
+        box.hidden = false;
+        box.innerHTML = `
+            <h3>Brief check
+                <span class="verdict ${pass ? "pass" : "fail"}">${
+            pass ? `Pass · ${validation.checks_passed}/${validation.checks_run}` : "Needs work"
+        }</span>
+            </h3>
+            <p class="muted">Code verifies these before you see the result.</p>
+            <ul class="checks">${items || "<li class='vcheck pass'><span class='mark'>✓</span><span>All checks passed</span></li>"}</ul>
+            ${
+                errors.length
+                    ? `<p class="muted small">${errors.length} blocking issue(s), ${
+                          warnings.length
+                      } warning(s).</p>`
+                    : ""
+            }`;
+    }
+
+    function renderBudgetPlan(plan) {
+        const box = $("budgetPlan");
+        if (!box) return;
+        if (!plan || !plan.phase1) { box.hidden = true; return; }
+
+        const line = (i) =>
+            `<tr><td>${esc(i.name)}</td><td class="num">${inr(i.line_total_inr)}</td></tr>`;
+        const phase = (p) => `
+            <h4>${esc(p.label)}</h4>
+            <table class="phase-table">${(p.line_items || []).map(line).join("")}</table>
+            <div class="phase-total"><span>Total</span><span class="num">${inr(p.total_inr)}</span></div>`;
+
+        box.hidden = false;
+        box.innerHTML = `
+            <h3>Budget check</h3>
+            <p class="muted">Every price comes from the product catalog and is added up by code.</p>
+            <p class="headline">${esc(plan.headline || "")}</p>
+            ${phase(plan.phase1)}
+            ${
+                plan.phase1 && plan.phase1.remaining_inr
+                    ? `<p class="muted small">${inr(plan.phase1.remaining_inr)} left of the budget</p>`
+                    : ""
+            }
+            ${plan.phase2 && plan.phase2.line_items && plan.phase2.line_items.length ? phase(plan.phase2) : ""}`;
+    }
 
     function renderEvaluation(evaluation) {
         if (!evaluation || !evaluation.scores) return;
@@ -179,7 +568,7 @@
                 <tr>
                     <td>${esc(f.name)}${f.quantity > 1 ? ` <span class="qty">×${f.quantity}</span>` : ""}</td>
                     <td>${esc((f.brand_suggestions || []).slice(0, 2).join(", ") || "—")}</td>
-                    <td class="num">${inr(f.estimated_price_inr)}</td>
+                    <td class="num">${inr(f.line_total_inr || f.estimated_price_inr)}</td>
                 </tr>`
             )
             .join("");
@@ -328,9 +717,13 @@
                     if (eventType === "complete") {
                         const data = JSON.parse(dataLine);
                         renderMeta(data);
+                        renderValidation(data.validation);
+                        renderBudgetPlan(data.budget_plan);
                         renderOptions(data.options || []);
                         renderEvaluation(data.evaluation);
                         renderSources(data.context_sources);
+                        renderLayout(payload);
+                        _afterResult(data, payload);
                     }
                 }
             }
@@ -357,17 +750,54 @@
 
         const data = await response.json();
         renderMeta(data);
+        renderValidation(data.validation);
+        renderBudgetPlan(data.budget_plan);
         renderOptions(data.options || []);
         renderEvaluation(data.evaluation);
         renderSources(data.context_sources);
+        renderLayout(payload);
+        _afterResult(data, payload);   // floor plan is independent of the LLM run
     }
 
     // ---------------------------------------------------------------- events
+
+    // Refinement and PDF controls. Bound once; both no-op until a design
+    // exists, which is checked inside each handler.
+    const refineBtn = $("refineBtn");
+    if (refineBtn) {
+        refineBtn.addEventListener("click", runRefine);
+    }
+    const refineInput = $("refineInput");
+    if (refineInput) {
+        refineInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); runRefine(); }
+        });
+    }
+    const pdfBtn = $("pdfBtn");
+    if (pdfBtn) {
+        pdfBtn.addEventListener("click", downloadPdf);
+    }
+
+    // Exposed for automated UI checks. The renderers are otherwise closure-
+    // scoped, which makes the completion path impossible to drive without
+    // waiting on a live LLM round trip. This is a test seam, not an API.
+    window.__interiorai = {
+        renderOptions: renderOptions,
+        renderValidation: renderValidation,
+        renderBudgetPlan: renderBudgetPlan,
+        afterResult: _afterResult,
+        buildPayload: buildPayload,
+        state: () => ({
+            currentDesign, currentLayout, currentVastu,
+            currentCost, currentBudgetPlan, lastValidation,
+        }),
+    };
 
     form.addEventListener("submit", async (e) => {
         e.preventDefault();
 
         const payload = buildPayload();
+        lastPayload = payload;
         if (!payload.client_preferences) {
             alert("Please describe the client's needs in the brief.");
             return;
@@ -375,6 +805,9 @@
 
         resetPipeline();
         setLoading(true);
+        // Draw the plan straight away. It is computed in code with no model
+        // call, so the user sees geometry while the design is still thinking.
+        renderLayout(payload);
 
         try {
             if (typeof fetch === "undefined" || !window.ReadableStream) {

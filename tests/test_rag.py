@@ -187,6 +187,56 @@ class TestJSONExtraction:
             extract_json("")
 
 
+class TestTruncatedJSONRepair:
+    """
+    Regression tests for truncated model output.
+
+    gemma2:2b routinely exceeds the token ceiling mid-JSON. Previously the
+    whole response was discarded and the agent silently fell back to an empty
+    design. Recovery is what keeps the pipeline producing output.
+    """
+
+    def test_recovers_from_truncation_mid_value(self):
+        assert extract_json('{"title": "Warmth", "concept": "A kitchen that welcom') == {
+            "title": "Warmth"
+        }
+
+    def test_recovers_from_truncation_mid_key(self):
+        out = extract_json('{"title": "X", "furniture": [{"name": "Sofa", "price"')
+        assert out["title"] == "X"
+        assert out["furniture"][0]["name"] == "Sofa"
+
+    def test_recovers_from_truncation_in_array(self):
+        assert extract_json('{"a": 1, "items": [1, 2, 3') == {"a": 1, "items": [1, 2]}
+
+    def test_recovers_from_nested_truncation(self):
+        out = extract_json('{"a": {"b": {"c": 1}, "d": [1,2')
+        assert out["a"]["b"]["c"] == 1
+        assert out["a"]["d"] == [1]
+
+    def test_preserves_numeric_values(self):
+        """
+        Regression: a naive string-close turned 5000 into 5.
+        Truncation recovery must never corrupt a complete value.
+        """
+        out = extract_json('{"title": "Perfect", "cost": 5000, "tags": ["a"], "x": "unfinis')
+        assert out["cost"] == 5000
+        assert out["title"] == "Perfect"
+        assert out["tags"] == ["a"]
+
+    def test_recovers_first_key_only(self):
+        assert extract_json('{"title": "Incomple') == {"title": "Incomple"}
+
+    def test_returns_object_not_nested_array(self):
+        """
+        Regression: the outermost-span fallback once returned ['a'] (a nested
+        array) for a truncated object payload.
+        """
+        out = extract_json('{"title": "Perfect", "tags": ["a"], "x": "unfinis')
+        assert isinstance(out, dict)
+        assert out["title"] == "Perfect"
+
+
 class TestEvaluationHarness:
     """
     Guards against the silent-metric failure mode.
