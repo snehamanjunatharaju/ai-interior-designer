@@ -307,6 +307,7 @@ async def evaluation_dashboard() -> Dict[str, Any]:
     """
     with tracer.start("api.evaluation"):
         from app.catalog import catalog
+        from app.services.knowledge_base import knowledge_stats
 
         snap = metrics.snapshot()
         counters = snap.get("counters", {})
@@ -363,6 +364,7 @@ async def evaluation_dashboard() -> Dict[str, Any]:
                 "inserted_required_items": counter("design.inserted_required_item"),
                 "over_budget_designs": counter("pricing.over_budget"),
             },
+            "retrieval": knowledge_stats(),
             "limits": {
                 "embedding_model": settings.EMBEDDING_MODEL,
                 "rag_min_score": settings.RAG_MIN_SCORE,

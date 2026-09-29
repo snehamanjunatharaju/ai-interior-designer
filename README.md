@@ -22,7 +22,7 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 Open http://localhost:8001 · API docs at `/docs`
 
 ```bash
-./venv/bin/python -m pytest        # 291 tests, ~5s, fully offline
+./venv/bin/python -m pytest        # 330 tests, ~4s, fully offline
 ```
 
 Ollama is optional. Without it the pipeline returns a catalog-driven fallback
@@ -48,7 +48,7 @@ PDF client proposal.
    Brief ──▶ BriefParser ──▶ BriefConstraints (item counts, money, colour,
    │                            dimensions, directions)  ← pure code
    │
-   ├──▶ RAG retrieval (hybrid search + citations)
+   ├──▶ Hybrid retrieval (BM25 + dense, rank-fused, metadata-filtered)
    │
    └──▶ Multi-agent pipeline
          Planner ──▶ Architect ──▶ [normalise] ──▶ price_design ──▶ validate
@@ -73,6 +73,22 @@ PDF client proposal.
 | Vastu compliance | `engine/vastu.py` | Falsifiable, reproducible |
 | Aesthetics, coherence | LLM critic | Genuinely subjective |
 
+**Retrieval is hybrid.** Dense vectors alone are a poor fit for the default
+hashing embedder, which has no semantic component: a brief asking for a "bunk
+bed" cannot reliably find the passage that says "bunk bed". BM25 supplies
+exact-term matching, and the two rankings are combined by Reciprocal Rank
+Fusion — by position, not by score, because a hashing cosine (~0.2) and a
+BM25 score (unbounded) are on unrelated scales.
+
+**Metadata is inferred, not hand-tagged.** Room, style, budget tier, and
+Vastu facets are derived from each passage's text, so they cannot drift out of
+step with the content when a passage is edited. A stale `room` tag silently
+removes a passage from the room it actually describes.
+
+**Filters narrow, they never exclude.** A passage with no room tag is general
+advice — "maintain 90 cm of circulation" applies everywhere — and demanding a
+tag would discard the most broadly useful guidance in the corpus.
+
 ---
 
 ## Modules
@@ -88,10 +104,10 @@ app/
     vastu.py    rule-based Vastu scoring
     refine.py   classify + apply targeted changes
   agents/       planner, architect, critic, orchestrator
-  services/     LLM providers, RAG, cache, evaluation, proposal (PDF)
+  services/     LLM providers, hybrid RAG, BM25, cache, evaluation, proposal (PDF)
   api/          FastAPI routes
 static/         layout.js (2D SVG), layout3d.js (three.js), app.js
-tests/          291 tests
+tests/          330 tests
 ```
 
 ---
@@ -164,9 +180,15 @@ design plan", so a 90-second request ended in a ₹0 design.
 
 - **Catalog prices are indicative**, rounded to ₹50, compiled from public
   listings — not scraped live. Verify a sample before quoting a client.
-- **The default embedder is hashing**, not sentence-transformers, so RAG
-  similarity scores sit low by design. Add `sentence-transformers` and set
-  `EMBEDDING_BACKEND` to improve retrieval.
+- **The knowledge corpus is 79 curated passages**, not the 200+ a production
+  system would need. Vastu coverage went from one passage to fifteen after this
+  was measured, but gaps remain in styling, and the coverage counts are
+  exposed at `GET /api/v1/evaluation` under `retrieval` so the limit is
+  visible rather than implied.
+- **The default embedder is hashing**, not sentence-transformers, so dense
+  scores sit low by design. BM25 is what carries exact-term recall. Add
+  `sentence-transformers` and set `EMBEDDING_BACKEND` to improve paraphrase
+  matching.
 - **Latency is dominated by the LLM** (~60-90s for a full run on gemma2:2b).
   The layout endpoint is code-only and returns in milliseconds.
 - **No rendered imagery or photo analysis.** Both need an external vision or
@@ -179,7 +201,7 @@ design plan", so a 90-second request ended in a ₹0 design.
 ## Testing
 
 ```bash
-./venv/bin/python -m pytest              # 291 tests
+./venv/bin/python -m pytest              # 330 tests
 ./venv/bin/python -m pytest tests/test_engine.py -v
 ```
 

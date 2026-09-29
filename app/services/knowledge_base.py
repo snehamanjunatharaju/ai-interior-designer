@@ -11,7 +11,13 @@ Each entry is chunked and embedded at startup.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Dict, List
+
+from app.services.knowledge_metadata import expand_chunks
+
+# Populated on first access by get_knowledge_base().
+_ANNOTATED = None
 
 KNOWLEDGE_BASE: List[Dict[str, str]] = [
     # ---- Space planning -------------------------------------------------
@@ -312,6 +318,54 @@ KNOWLEDGE_BASE: List[Dict[str, str]] = [
 ]
 
 
-def get_knowledge_base() -> List[Dict[str, str]]:
-    """Return the raw knowledge base entries."""
+def get_knowledge_base() -> List[Dict[str, object]]:
+    """
+    Return the knowledge base with filterable metadata attached.
+
+    Metadata is inferred from the passage text on first call and cached. It is
+    derived rather than hand-tagged so the facets cannot drift out of step
+    with the content when a passage is edited - a stale `room` tag silently
+    removes a passage from the room it actually describes.
+
+    The returned list is cached and shared; treat it as read-only.
+    """
+    global _ANNOTATED
+    if _ANNOTATED is None:
+        # The extended corpus is merged here rather than in the module that
+        # defines it, so both halves can be edited independently and there is
+        # exactly one place that decides what the retriever sees.
+        from app.services.knowledge_extended import EXTENDED_KNOWLEDGE
+
+        _ANNOTATED = expand_chunks(list(KNOWLEDGE_BASE) + list(EXTENDED_KNOWLEDGE))
+    return _ANNOTATED
+
+
+def get_knowledge_base_raw() -> List[Dict[str, str]]:
+    """The original entries, without inferred metadata."""
     return KNOWLEDGE_BASE
+
+
+def knowledge_stats() -> Dict[str, object]:
+    """
+    Corpus coverage, so retriever quality can be reported honestly.
+
+    A corpus of a few dozen passages cannot answer every interior design
+    question well, and the evaluation dashboard should say so rather than
+    implying a curated library.
+    """
+    entries = get_knowledge_base()
+    rooms: Counter = Counter()
+    styles: Counter = Counter()
+    tiers: Counter = Counter()
+    for entry in entries:
+        rooms.update(entry.get("rooms") or [])
+        styles.update(entry.get("styles") or [])
+        tiers.update(entry.get("budget_tiers") or [])
+    return {
+        "chunks": len(entries),
+        "vastu_chunks": sum(1 for e in entries if e.get("vastu")),
+        "by_room": dict(rooms),
+        "by_style": dict(styles),
+        "by_budget_tier": dict(tiers),
+        "unfiltered": sum(1 for e in entries if not (e.get("rooms") or [])),
+    }

@@ -2,20 +2,29 @@
 Retrieval service (RAG).
 
 Owns the vector index lifecycle, builds queries from a structured design
-brief, and reranks results. This is what grounds the agents' output in
-verifiable domain facts instead of model memory.
+brief, and fuses dense and lexical rankings. This is what grounds the agents'
+output in verifiable domain facts instead of model memory.
+
+Retrieval is hybrid. Dense vectors alone are a poor fit for the default
+hashing embedder, which has no semantic component and scores everything
+around 0.2; a brief asking for a "bunk bed" needs the passage that says
+exactly that. BM25 supplies exact-term matching, and the two rankings are
+combined by Reciprocal Rank Fusion so neither scale has to be calibrated
+against the other.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 from app.core.observability import get_logger, metrics, tracer
 from app.core.schemas import DesignRequest, RetrievedContext
+from app.services.bm25 import BM25Index, reciprocal_rank_fusion
 from app.services.embeddings import get_embedder
 from app.services.knowledge_base import get_knowledge_base
+from app.services.knowledge_metadata import matches_filter
 from app.services.vector_store import Chunk, VectorStore
 
 logger = get_logger(__name__)
@@ -32,6 +41,10 @@ class RetrievalService:
     def __init__(self) -> None:
         self._embedder = None
         self._store: Optional[VectorStore] = None
+        self._bm25 = BM25Index()
+        # The corpus, kept in memory so metadata filtering and citation
+        # building need no second lookup.
+        self._entries: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self._ready = False
 
@@ -49,6 +62,11 @@ class RetrievalService:
             store = VectorStore.load(dim, settings.VECTOR_STORE_PATH)
             if store.is_empty or force:
                 self._build_index(store)
+            else:
+                # The persisted store skips embedding, but the lexical index
+                # and metadata are cheap to rebuild and must stay in step
+                # with whatever corpus the store was built from.
+                self._build_lexical(get_knowledge_base())
 
             self._store = store
             self._ready = True
@@ -66,14 +84,35 @@ class RetrievalService:
                 content=entry["content"],
                 source=entry.get("source", ""),
                 category=entry.get("category", ""),
-                metadata={"index": i},
+                metadata={
+                    "index": i,
+                    "rooms": entry.get("rooms", []),
+                    "styles": entry.get("styles", []),
+                    "budget_tiers": entry.get("budget_tiers", []),
+                    "vastu": bool(entry.get("vastu", False)),
+                },
                 embedding=vectors[i],
             )
             for i, entry in enumerate(entries)
         ]
         store.add(chunks)
         store.save()
-        logger.info("kb_index_built chunks=%d dim=%d", len(chunks), self._embedder.dim)
+        self._build_lexical(entries)
+        logger.info(
+            "kb_index_built chunks=%d dim=%d vocab=%d",
+            len(chunks), self._embedder.dim, self._bm25.vocabulary_size,
+        )
+
+    def _build_lexical(self, entries: List[Dict[str, Any]]) -> None:
+        """
+        Build the BM25 index over the same corpus.
+
+        Kept in step with the vector store deliberately: a lexical index
+        pointing at different documents would fuse nonsense, and the two are
+        rebuilt together in `_build_index`.
+        """
+        self._bm25 = BM25Index().build([e["content"] for e in entries])
+        self._entries = entries
 
     # -- query construction ------------------------------------------------
 
@@ -110,49 +149,100 @@ class RetrievalService:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         category: Optional[str] = None,
+        room: Optional[str] = None,
+        style: Optional[str] = None,
+        budget_tier: Optional[str] = None,
+        require_vastu: bool = False,
     ) -> List[RetrievedContext]:
-        """Retrieve the most relevant knowledge chunks for a query."""
+        """
+        Retrieve the most relevant knowledge chunks for a query.
+
+        Hybrid: the dense and BM25 rankings are fused with Reciprocal Rank
+        Fusion. The two signals are fused by position rather than blended by
+        score, because a hashing cosine (~0.2) and a BM25 score (unbounded)
+        are on unrelated scales and any weighting between them would be
+        arbitrary.
+
+        Filters narrow the candidate pool but never exclude general advice: a
+        passage with no room tag is applicable everywhere, so demanding a tag
+        would discard the most broadly useful guidance in the corpus.
+        """
         if not self._ready:
             self.initialize()
         if self._store is None or self._store.is_empty:
             return []
 
         top_k = top_k or settings.RAG_TOP_K
-        min_score = settings.RAG_MIN_SCORE if min_score is None else min_score
+        # The fused score is a rank score, not a cosine, so RAG_MIN_SCORE no
+        # longer applies here; it stays for the dense-only path.
+        pool = max(top_k * 4, 20)
 
         with tracer.start("rag.retrieve", query=query[:80]):
             qvec = self._embedder.embed(query)
-            hits = self._store.search(qvec, top_k=top_k * 2, min_score=min_score)
+            dense = self._store.search(qvec, top_k=pool, min_score=0.0)
+            lexical = self._bm25.top_k(query, pool)
 
-            if category:
-                filtered = [(c, s) for c, s in hits if c.category == category]
-                hits = filtered or hits
-
-            hits = hits[:top_k]
-            if settings.RERANK_ENABLED:
-                hits = self._rerank(query, hits)
-
-            results = [
-                RetrievedContext(
-                    content=chunk.content,
-                    source=chunk.source,
-                    score=round(score, 4),
-                    metadata={**chunk.metadata, "category": chunk.category},
-                )
-                for chunk, score in hits
+            # Both rankings index the same corpus by position.
+            dense_ranked = [
+                (int(c.metadata.get("index", 0)), float(s)) for c, s in dense
             ]
+            fused = reciprocal_rank_fusion([dense_ranked, lexical])
+
+            entries = self._entries or get_knowledge_base()
+
+            picked: List[RetrievedContext] = []
+            for idx, score in fused:
+                if idx < 0 or idx >= len(entries):
+                    continue
+                entry = entries[idx]
+                if category and entry.get("category") != category:
+                    continue
+                if not matches_filter(
+                    entry, room=room, style=style,
+                    budget_tier=budget_tier, require_vastu=require_vastu,
+                ):
+                    continue
+                picked.append(RetrievedContext(
+                    content=entry["content"],
+                    source=entry.get("source", ""),
+                    score=round(score, 4),
+                    metadata={
+                        "category": entry.get("category", ""),
+                        "rooms": entry.get("rooms", []),
+                        "styles": entry.get("styles", []),
+                        "budget_tiers": entry.get("budget_tiers", []),
+                        "vastu": bool(entry.get("vastu", False)),
+                    },
+                ))
+                if len(picked) >= top_k:
+                    break
 
         metrics.increment("rag.queries")
-        metrics.observe("rag.top_score", results[0].score if results else 0.0)
-        logger.info("rag_retrieve hits=%d top_score=%.3f", len(results),
-                    results[0].score if results else 0.0)
-        return results
+        metrics.observe("rag.top_score", picked[0].score if picked else 0.0)
+        logger.info(
+            "rag_retrieve hits=%d top_score=%.3f dense=%d lexical=%d",
+            len(picked), picked[0].score if picked else 0.0,
+            len(dense), len(lexical),
+        )
+        return picked
 
     async def retrieve_for_request(
         self, request: DesignRequest, top_k: Optional[int] = None
     ) -> List[RetrievedContext]:
-        """Convenience wrapper that builds the query from a design brief."""
-        return await self.retrieve(self.build_query(request), top_k=top_k)
+        """
+        Retrieve for a brief, passing its structured fields as filters.
+
+        Room, style, and budget are already known from the form, so spending
+        recall on guidance for the wrong kind of room is pure waste.
+        """
+        return await self.retrieve(
+            self.build_query(request),
+            top_k=top_k,
+            room=request.room_type.value,
+            style=request.style.value,
+            budget_tier=request.budget.value,
+            require_vastu=request.vastu_compliance.value == "strict",
+        )
 
     # -- reranking ---------------------------------------------------------
 
