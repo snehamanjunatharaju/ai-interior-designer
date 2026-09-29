@@ -50,6 +50,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Never block startup on the index; retrieval degrades gracefully.
         logger.error("retrieval_init_failed error=%s", exc)
 
+    # Warm the price catalog here rather than on the first request. Without
+    # this the first /layout call pays the seeding cost, and a read-only
+    # data directory would turn that into a 500 on the client's first click
+    # instead of a clear startup warning.
+    try:
+        from app.catalog import catalog
+
+        catalog.initialize()
+        logger.info(
+            "catalog_ready items=%d version=%s", catalog.count(), catalog.version()
+        )
+    except Exception as exc:
+        logger.error("catalog_init_failed error=%s", exc)
+
     provider_health = await registry.health()
     up = [n for n, h in provider_health.items() if h["reachable"]]
     logger.info("providers_ready reachable=%s all=%s", up, list(provider_health))
