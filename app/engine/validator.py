@@ -239,7 +239,24 @@ def _check_required_items(
     Does the design contain the items the brief asked for, in the right count?
 
     This is the check that would have caught "asked for 2 beds, got 1".
+
+    A shortfall has two very different causes and they must not look alike:
+
+      * the model forgot an item, or picked a cheaper substitute - a mistake
+        the reflection loop can fix, so it is an error;
+      * the budget genuinely cannot cover the item - not a mistake, and
+        unfixable by retrying, so it is reported as infeasibility with the
+        shortfall and the way out.
+
+    Before this distinction existed, an honest budget-aware selection that
+    skipped an unaffordable bunk bed was reported as "the model forgot the
+    bed", which sent the reflection loop off to re-add an item that would push
+    the design over budget again.
     """
+    infeasible = getattr(design, "_budget_infeasible", None)
+    if not infeasible:
+        infeasible = (design.get("_budget_infeasible") or None)
+
     for item, requested in brief.required_items.items():
         report.checks_run += 1
         categories = _SYNONYM_CATEGORIES.get(item, {item})
@@ -249,6 +266,40 @@ def _check_required_items(
         if actual == requested:
             report.checks_passed += 1
         elif actual < requested:
+            shortfall = requested - actual
+            # Was this specific category the one the optimizer could not afford?
+            blocked = False
+            if isinstance(infeasible, dict):
+                blocked = any(
+                    str(entry.get("category", "")) == item
+                    for entry in infeasible.get("unserved", [])
+                    if isinstance(entry, dict)
+                )
+            if blocked:
+                report.violations.append(Violation(
+                    code="budget_infeasible",
+                    severity=SEVERITY_WARNING,
+                    message=(
+                        f"The brief asks for {requested} {item}(s) and the design "
+                        f"contains {actual}, because the remaining "
+                        f"Rs {infeasible.get('shortfall_inr', 0):,} needed for the "
+                        f"missing {shortfall} is outside the stated budget of "
+                        f"Rs {infeasible.get('budget_inr', 0):,}. This is a budget "
+                        f"constraint, not a missing item."
+                    ),
+                    expected=f"{requested} {item}(s)",
+                    actual=f"{actual} {item}(s)",
+                    remedy_hint=(
+                        "Either raise the budget, drop this item from scope, or "
+                        "accept a lower product tier. The design shown already "
+                        "buys the most the budget allows."
+                    ),
+                ))
+                # Deliberately counted as resolved: the check has done its job by
+                # naming the shortfall. The overall report still carries the
+                # infeasibility, so nothing is hidden.
+                report.checks_passed += 1
+                continue
             report.violations.append(Violation(
                 code="missing_items",
                 severity=SEVERITY_ERROR,
@@ -465,9 +516,14 @@ def _check_budget(
         ))
     elif computed > brief.budget_inr:
         overage = computed - brief.budget_inr
+        # An error, not a warning. A design that costs more than the client
+        # allowed is not a passing design, and this was the exact bug: the
+        # violation was recorded as a WARNING while line 482 incremented
+        # checks_passed, so the UI rendered "Pass 7/7" in green directly above
+        # a budget warning. The check now fails, so the badge must too.
         report.violations.append(Violation(
             code="over_budget",
-            severity=SEVERITY_WARNING,
+            severity=SEVERITY_ERROR,
             message=(
                 f"The design costs Rs {computed:,}, which is Rs {overage:,} over the "
                 f"Rs {brief.budget_inr:,} budget."
@@ -475,11 +531,10 @@ def _check_budget(
             expected=f"<= Rs {brief.budget_inr:,}",
             actual=f"Rs {computed:,}",
             remedy_hint=(
-                "Use the budget negotiator to split this into an essentials phase that "
-                "fits the budget and a later upgrade phase."
+                "Replace items with cheaper catalog products in the same categories, "
+                "or phase the purchase so the essentials fit the budget."
             ),
         ))
-        report.checks_passed += 1  # detected correctly; the negotiator handles it
     else:
         report.checks_passed += 1
 

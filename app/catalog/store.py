@@ -108,8 +108,19 @@ class Catalog:
     # -- lifecycle ----------------------------------------------------------
 
     def initialize(self) -> None:
-        """Create the database, seed it, and warm the in-process cache."""
+        """Create the database, seed it, and warm the in-process cache.
+
+        Idempotent: once the catalog is warm this returns immediately rather
+        than re-running migrations, seeding, and the ready log line. Callers
+        invoke it defensively before reading, so a non-guarded call must not
+        turn every request into a full re-initialise.
+        """
+        if self._ready:
+            return
         with self._lock:
+            # Another thread may have finished initialising while we waited.
+            if self._ready:
+                return
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._migrate()
             self._seed_if_empty()

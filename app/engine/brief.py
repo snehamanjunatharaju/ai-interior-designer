@@ -357,7 +357,11 @@ def parse_dimensions(text: str) -> RoomDimensions:
     Extract room dimensions.
 
     Handles "12 x 10 ft", "12ft x 10ft", "12' x 10'", "3.6m x 3m",
+    "240cm x 200cm", "12ft x 10ft (2400mm x 3000mm)", "12ft 6in x 10ft",
     "ceiling 9ft", "height 9 ft". The longer number is treated as length.
+    Feet, metres, centimetres, millimetres and inches are all accepted, because
+    a brief copied from a builder or an architect's plan arrives in any of
+    them and rejecting one would reject the whole request.
     """
     dims = RoomDimensions()
     if not text:
@@ -385,31 +389,50 @@ def parse_dimensions(text: str) -> RoomDimensions:
             dims.length_ft = round(max(a, b) / 0.3048, 1)
             dims.width_ft = round(min(a, b) / 0.3048, 1)
         else:
-            # Explicit centimetres: "240cm x 200cm". Checked before the
-            # unit-less form because 240 is far too large to be feet.
+            # Explicit sub-metre units: "240cm x 200cm", "1200mm x 1500mm",
+            # and "12ft 6in". Checked before the unit-less form because 240 is
+            # far too large to be feet.
             cm_match = re.search(
-                r"(\d+(?:\.\d+)?)\s*cm\s*(?:x|×|\*)\s*(\d+(?:\.\d+)?)\s*cm", lower
+                r"(\d+(?:\.\d+)?)\s*(cm|mm)\s*(?:x|×|\*)\s*(\d+(?:\.\d+)?)\s*(cm|mm)",
+                lower,
             )
             if cm_match:
-                a, b = float(cm_match.group(1)), float(cm_match.group(2))
+                # Honour each side's own unit rather than assuming they match.
+                # Factor converts the side's unit into centimetres.
+                to_cm = {"cm": 1.0, "mm": 0.1}
+                a = float(cm_match.group(1)) * to_cm[cm_match.group(2)]
+                b = float(cm_match.group(3)) * to_cm[cm_match.group(4)]
                 dims.length_cm = int(max(a, b))
                 dims.width_cm = int(min(a, b))
                 dims.length_ft = round(dims.length_cm / 30.48, 1)
                 dims.width_ft = round(dims.width_cm / 30.48, 1)
             else:
-                # A bare "10 x 12" with no unit. Ambiguous in principle, but
-                # Indian residential briefs mean feet almost universally, and
-                # a bare pair above 20 is implausible in either unit. Recorded
-                # as feet so the common case works rather than failing.
-                bare = re.search(
-                    r"(?<![\d.])(\d{1,2}(?:\.\d)?)\s*(?:x|×|\*)\s*(\d{1,2}(?:\.\d)?)"
-                    r"(?!\s*(?:cm|mm|m\b|ft|feet|foot|'))",
+                inches_match = re.search(
+                    r"(\d+(?:\.\d+)?)\s*(?:in\b|inches|inch|\")\s*(?:x|×|\*)\s*"
+                    r"(\d+(?:\.\d+)?)\s*(?:in\b|inches|inch|\")",
                     lower,
                 )
-                if bare:
-                    a, b = float(bare.group(1)), float(bare.group(2))
-                    if 3 <= max(a, b) <= 40:
-                        dims.length_ft, dims.width_ft = max(a, b), min(a, b)
+                if inches_match:
+                    a, b = float(inches_match.group(1)), float(inches_match.group(2))
+                    dims.length_cm = int(max(a, b) * 2.54)
+                    dims.width_cm = int(min(a, b) * 2.54)
+                    dims.length_ft = round(dims.length_cm / 30.48, 1)
+                    dims.width_ft = round(dims.width_cm / 30.48, 1)
+                else:
+                    # A bare "10 x 12" with no unit. Ambiguous in principle,
+                    # but Indian residential briefs mean feet almost
+                    # universally, and a bare pair above 20 is implausible in
+                    # either unit. Recorded as feet so the common case works
+                    # rather than failing.
+                    bare = re.search(
+                        r"(?<![\d.])(\d{1,2}(?:\.\d)?)\s*(?:x|×|\*)\s*(\d{1,2}(?:\.\d)?)"
+                        r"(?!\s*(?:cm|mm|m\b|in\b|ft|feet|foot|'))",
+                        lower,
+                    )
+                    if bare:
+                        a, b = float(bare.group(1)), float(bare.group(2))
+                        if 3 <= max(a, b) <= 40:
+                            dims.length_ft, dims.width_ft = max(a, b), min(a, b)
 
     # Ceiling / height
     ch_match = re.search(
@@ -426,8 +449,13 @@ def parse_dimensions(text: str) -> RoomDimensions:
             dims.ceiling_ft = round(float(ch_match_m.group(1)) / 0.3048, 1)
 
     if dims.length_ft and dims.width_ft:
-        dims.length_cm = ft_to_cm(dims.length_ft)
-        dims.width_cm = ft_to_cm(dims.width_ft)
+        # Only derive the centimetre values when they were not given directly.
+        # A metric brief ("1200mm x 1500mm") is already exact, and round-tripping
+        # it through feet loses precision - 150cm came back as 149.
+        if dims.length_cm is None:
+            dims.length_cm = ft_to_cm(dims.length_ft)
+        if dims.width_cm is None:
+            dims.width_cm = ft_to_cm(dims.width_ft)
     if dims.ceiling_ft:
         dims.ceiling_cm = ft_to_cm(dims.ceiling_ft)
 

@@ -13,6 +13,7 @@ from typing import Any, Dict
 import numpy as np
 import pytest
 
+from app.engine.brief import BriefConstraints
 from app.services.llm_provider import CircuitBreaker, LLMProvider
 from app.services.semantic_cache import SemanticCache
 
@@ -315,12 +316,50 @@ class TestSafeTextCoercion:
         assert _text(42) == "42"
         assert _text(True) == "True"
 
-    def test_dicts_are_serialised(self):
-        import json
-
+    def test_dicts_render_as_prose_not_json(self):
+        """
+        The model sometimes answers a prose field with an object. Serialising it
+        put raw `{"name": ...}` in front of the user in the layout description,
+        so a mapping is rendered as readable lines instead.
+        """
         from app.agents.orchestrator import _text
 
-        assert json.loads(_text({"a": 1})) == {"a": 1}
+        out = _text({"main_functional_zone": "sleeping", "floor_plan": "bed north"})
+        assert "main functional zone" in out
+        assert "sleeping" in out
+        assert "{" not in out and "}" not in out
+
+    def test_dict_rendering_skips_empty_values(self):
+        from app.agents.orchestrator import _text
+
+        out = _text({"a": "kept", "b": None, "c": "", "d": []})
+        assert "kept" in out
+        assert "b:" not in out and "c:" not in out and "d:" not in out
+
+    def test_html_entities_are_decoded(self):
+        """
+        gemma2:2b writes `&quot;` and `&amp;` instead of real characters. Left
+        alone they reached the client verbatim in the pros and the concept.
+        """
+        from app.agents.orchestrator import _text
+
+        assert _text('he said &quot;bunk bed&quot;') == 'he said "bunk bed"'
+        assert _text("bed &amp; wardrobe") == "bed & wardrobe"
+
+    def test_lists_are_joined(self):
+        from app.agents.orchestrator import _text
+
+        assert _text(["one", "two"]) == "one; two"
+
+    def test_plain_json_string_is_left_alone(self):
+        """
+        A *string* that happens to contain JSON is content, not a structure to
+        rewrite - it must survive untouched.
+        """
+        from app.agents.orchestrator import _text
+
+        raw = '{"name": "Bed"}'
+        assert _text(raw) == raw
 
     def test_truncation_still_applies(self):
         from app.agents.orchestrator import _text
@@ -386,6 +425,79 @@ class TestCriticAgent:
     def test_defaults_when_scores_absent(self, agent):
         out = agent._sanitize({})
         assert all(0 <= v <= 10 for v in out["scores"].values())
+
+
+class TestInventedSkuRepair:
+    """
+    gemma2:2b is asked to choose from a catalog list and sometimes invents a
+    plausible code instead ("CHR-01"). An invented code cannot be priced,
+    measured or bought, so it must be swapped for a real product before the
+    design reaches a client.
+    """
+
+    @pytest.fixture
+    def pipeline(self):
+        from app.agents.orchestrator import DesignPipeline
+
+        return DesignPipeline()
+
+    def _design(self, sku, name, category):
+        return {
+            "title": "T",
+            "furniture": [
+                {"name": name, "sku": sku, "category": category, "quantity": 1}
+            ],
+        }
+
+    def test_invented_sku_is_replaced_by_a_real_product(self, pipeline):
+        from app.catalog import catalog
+
+        constraints = BriefConstraints()
+        design = self._design("CHR-01", "Kids Chair", "chair")
+        out = pipeline._normalize_design(design, constraints)
+        item = out["furniture"][0]
+        assert catalog.get(item["sku"]) is not None, "SKU must exist in catalog"
+        assert "Chair" in item["name"]
+
+    def test_repaired_item_carries_real_dimensions(self, pipeline):
+        from app.catalog import catalog
+
+        out = pipeline._normalize_design(
+            self._design("DSK-XX-99", "Kids Study Table 90cm", "desk"),
+            BriefConstraints(),
+        )
+        product = catalog.get(out["furniture"][0]["sku"])
+        assert out["furniture"][0]["width_cm"] == product.width_cm
+
+    def test_an_item_with_no_sku_is_left_alone(self, pipeline):
+        """
+        No SKU means the model did not claim a product. Guessing one would
+        invent a line item nobody asked for, so the validator must still see it
+        as uncatalogued rather than have a product silently attached.
+        """
+        design = {
+            "title": "T",
+            "furniture": [{"name": "Sofa", "quantity": 1}],
+        }
+        out = pipeline._normalize_design(design, BriefConstraints())
+        assert not out["furniture"][0].get("sku")
+
+    def test_a_valid_sku_is_not_disturbed(self, pipeline):
+        out = pipeline._normalize_design(
+            self._design("BED-KID-BUNK-01", "Kids Bunk Bed (upper + lower)", "bed"),
+            BriefConstraints(),
+        )
+        assert out["furniture"][0]["sku"] == "BED-KID-BUNK-01"
+
+    def test_unrecognisable_item_keeps_its_sku_for_the_validator(self, pipeline):
+        from app.catalog import catalog
+
+        out = pipeline._normalize_design(
+            self._design("ZZZ-1", "Quantum flux capacitor", "???"),
+            BriefConstraints(),
+        )
+        sku = out["furniture"][0]["sku"]
+        assert catalog.get(sku) is None
 
 
 class TestDesignPipelineHelpers:

@@ -69,6 +69,11 @@ def price_design(
                 })
                 continue
             item = match
+            # Write the resolved SKU back onto the entry. The line is now
+            # genuinely catalog-backed, but without this the validator still
+            # sees the empty/invented SKU and reports `uncatalogued_item` for an
+            # item that was successfully priced.
+            entry["sku"] = item.sku
 
         try:
             qty = int(float(entry.get("quantity", 1) or 1))
@@ -136,7 +141,15 @@ def price_design(
 
     if unpriced_items:
         metrics.increment("pricing.unpriced_items")
-        logger.warning("pricing_incomplete unpriced=%d", len(unpriced_items))
+        # Name the items: a bare count says something is wrong but not what,
+        # which is useless when triaging from logs alone.
+        logger.warning(
+            "pricing_incomplete unpriced=%d items=%s",
+            len(unpriced_items),
+            "; ".join(
+                f"{u['name']} ({u['reason']})" for u in unpriced_items[:5]
+            ),
+        )
 
     if not within_budget:
         metrics.increment("pricing.over_budget")
@@ -211,13 +224,24 @@ def build_phased_plan(
     number that fits the budget is worse than a real number that does not,
     because the client discovers the truth at the furniture store.
 
-    Ordering is by catalog tier, then by price: essentials first.
+    Ordering is by *functional priority*, not by catalog tier and not by price.
+    The previous version sorted on tier, which put a Rs 450 string-light set
+    and a Rs 2200 ceiling paint ahead of the bed, so "Phase 1 - buy now" could
+    deliver a beautifully lit room with nowhere to sleep. A room needs its
+    essentials before its finishing touches, so that is the order used here:
+    bed, mattress, wardrobe, desk, chair first, then seating and tables, then
+    lighting and soft goods, then decor.
     """
-    tier_rank = {TIER_ESSENTIAL: 0, "standard": 1, "upgrade": 2}
-    ordered = sorted(
-        line_items,
-        key=lambda i: (tier_rank.get(i.get("tier", "standard"), 1), i["line_total_inr"]),
-    )
+    from app.engine.budget_optimizer import CATEGORY_PRIORITY
+
+    def sort_key(item: Dict[str, Any]) -> tuple:
+        category = str(item.get("category", "")).lower()
+        priority = CATEGORY_PRIORITY.get(category, 50)
+        # Within a priority, cheaper lines first so that when the budget runs
+        # out mid-group the remaining headroom buys as much as possible.
+        return (priority, item.get("line_total_inr", 0))
+
+    ordered = sorted(line_items, key=sort_key)
 
     phase1: List[Dict[str, Any]] = []
     phase2: List[Dict[str, Any]] = []
@@ -241,11 +265,13 @@ def build_phased_plan(
             "line_items": phase1,
             "total_inr": phase1_total,
             "remaining_inr": max(0, budget_inr - phase1_total),
+            "categories": sorted({i["category"] for i in phase1}),
         },
         "phase2": {
             "label": "Phase 2 - add later",
             "line_items": phase2,
             "total_inr": phase2_total,
+            "categories": sorted({i["category"] for i in phase2}),
         },
         "headline": (
             f"Rs {budget_inr:,} covers the essentials, not everything. "

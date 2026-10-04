@@ -237,6 +237,64 @@ class TestTruncatedJSONRepair:
         assert out["title"] == "Perfect"
 
 
+class TestJSONPunctuationRepair:
+    """
+    Small models emit structurally complete JSON with cosmetic punctuation
+    slips: a trailing comma before a closing bracket, or a missing comma
+    between two values. Both are unparseable, and both used to cost the whole
+    response - the architect and critic agents fell back to catalog filler
+    whenever it happened.
+    """
+
+    def test_removes_trailing_comma_in_object(self):
+        assert extract_json('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}
+
+    def test_removes_trailing_comma_in_array(self):
+        assert extract_json('{"a": [1, 2, 3,]}') == {"a": [1, 2, 3]}
+
+    def test_removes_trailing_comma_before_newline(self):
+        # The comma and the bracket are usually a line apart, so the scan has
+        # to look back past whitespace.
+        raw = '{\n  "furniture": [\n    {"sku": "A"},\n  ],\n  "title": "X"\n}'
+        assert extract_json(raw) == {"furniture": [{"sku": "A"}], "title": "X"}
+
+    def test_inserts_missing_comma_between_strings(self):
+        assert extract_json('{"a": ["x" "y"]}') == {"a": ["x", "y"]}
+
+    def test_inserts_missing_comma_between_numbers(self):
+        assert extract_json('[1 2 3]') == [1, 2, 3]
+
+    def test_inserts_missing_comma_between_literals(self):
+        assert extract_json('[true false null]') == [True, False, None]
+
+    def test_inserts_missing_comma_across_newline(self):
+        raw = '{\n  "hex_codes": [\n    "#e2f0ff", \n    "#d4b5cf",\n    "#d9ecf3",\n  ]\n}'
+        assert extract_json(raw) == {
+            "hex_codes": ["#e2f0ff", "#d4b5cf", "#d9ecf3"]
+        }
+
+    def test_does_not_touch_commas_inside_strings(self):
+        raw = '{"copy": "a, b, and ] c}", "other": "d}"}'
+        assert extract_json(raw) == {"copy": "a, b, and ] c}", "other": "d}"}
+
+    def test_does_not_split_numbers_at_the_decimal_point(self):
+        # Normalisation must not mistake a decimal point for a value boundary.
+        assert extract_json('{"a": -4.5, "b": 1234.75}') == {"a": -4.5, "b": 1234.75}
+
+    def test_preserves_valid_json_unchanged(self):
+        raw = '{"a": 1, "b": [1, 2, {"c": "d"}], "e": null, "f": true}'
+        assert extract_json(raw) == {
+            "a": 1, "b": [1, 2, {"c": "d"}], "e": None, "f": True
+        }
+
+    def test_preserves_escaped_quotes(self):
+        raw = '{"copy": "he said \\"hello\\" twice"}'
+        assert extract_json(raw) == {"copy": 'he said "hello" twice'}
+
+    def test_handles_empty_containers(self):
+        assert extract_json('{"a": [], "b": {}}') == {"a": [], "b": {}}
+
+
 class TestEvaluationHarness:
     """
     Guards against the silent-metric failure mode.

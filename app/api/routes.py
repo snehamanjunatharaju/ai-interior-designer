@@ -89,7 +89,7 @@ async def compute_layout(payload: DesignRequest) -> Dict[str, Any]:
         # than inventing a room size.
         if not dims.is_known():
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "Room dimensions are required for a floor plan. "
                     "Supply room_dimensions as e.g. '12ft x 10ft'."
@@ -162,16 +162,48 @@ async def proposal_pdf(payload: Dict[str, Any]) -> Any:
 
         from app.services.proposal import build_proposal_pdf
 
+        from app.engine.pricing import price_design
+
         design = payload.get("design")
         if not isinstance(design, dict):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Send the current design as `design`.",
             )
 
+        # Cost the design in code when the caller did not pass a costing block.
+        # A client that sends only the design it was shown used to produce a
+        # proposal reading "Rs 0" and "version n/a", because the PDF trusted a
+        # `cost` key that was optional. Prices must come from the catalog here,
+        # not from whatever the caller happened to send.
+        cost = payload.get("cost")
+        source = design
+        if not source.get("furniture") and isinstance(
+            design.get("options"), list
+        ) and design["options"]:
+            source = design["options"][0]
+
+        computed = None
+        if isinstance(source, dict) and source.get("furniture"):
+            computed = price_design(source, budget_inr=payload.get("budget_inr"))
+
+        if not isinstance(cost, dict) or "estimated_cost_inr" not in cost:
+            cost = computed
+        elif computed is not None:
+            # A caller-supplied total is honoured, but its shopping list is
+            # not trusted: a cost dict carrying only a figure produced a PDF
+            # with a headline number and no itemised list at all. Fill the
+            # priced detail from code and keep the caller's total.
+            merged = dict(cost)
+            for key in ("line_items", "budget_breakdown", "catalog_version",
+                        "cost_drivers", "cost_savings", "costing_complete"):
+                if not merged.get(key) and computed.get(key):
+                    merged[key] = computed[key]
+            cost = merged
+
         pdf = build_proposal_pdf(
             design=design,
-            cost=payload.get("cost"),
+            cost=cost,
             layout=payload.get("layout"),
             validation=payload.get("validation"),
             vastu=payload.get("vastu"),
@@ -216,13 +248,13 @@ async def refine_design(payload: Dict[str, Any]) -> Dict[str, Any]:
         design = payload.get("design")
         if not isinstance(design, dict):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Send the current design as `design`.",
             )
         request_text = str(payload.get("request", "")).strip()
         if not request_text:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Send a `request` describing what to change.",
             )
 
@@ -256,6 +288,11 @@ async def refine_design(payload: Dict[str, Any]) -> Dict[str, Any]:
             "message": describe_change(intent),
             "intent": intent.to_dict(),
             "changed_fields": changed_fields,
+            # When a request was understood but could not be carried out -
+            # "make the desk bigger" and the catalog has nothing larger - the
+            # reason belongs in the response, or the client shows an edit that
+            # silently did nothing.
+            "note": updated.get("_refinement", {}).get("note"),
             "design": updated,
             "cost": cost,
             "budget_plan": plan,
@@ -279,7 +316,7 @@ async def score_vastu(payload: Dict[str, Any]) -> Dict[str, Any]:
         items = payload.get("items")
         if not isinstance(items, list):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Send layout `items` (from /api/v1/layout) to assess.",
             )
         report = evaluate_vastu(

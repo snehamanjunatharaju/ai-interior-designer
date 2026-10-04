@@ -220,6 +220,36 @@ class TestRefinementApplication:
         apply_refinement(d, classify_refinement("make it bluer"))
         assert "color_palette" in d["_refinement"]["changed"]
 
+    def test_impossible_resize_reports_why_instead_of_silently_nothing(self):
+        """
+        "Make the desk bigger" when the catalog has nothing larger used to
+        return changed=[] with no explanation, which the UI renders as a button
+        that did nothing. The reason must be in the response.
+        """
+        d = _design()
+        d["furniture"] = [{
+            "name": "Study Desk 120cm with Drawer",
+            "sku": "DSK-STD-01",
+            "category": "desk",
+            "quantity": 1,
+        }]
+        apply_refinement(d, classify_refinement("make the desk bigger"))
+        note = d.get("_refinement", {}).get("note")
+        assert note, "an unachievable resize must explain itself"
+        assert "largest" in note
+
+    def test_achievable_resize_reports_no_note(self):
+        d = _design()
+        d["furniture"] = [{
+            "name": "Kids Study Table 90cm",
+            "sku": "DSK-KID-01",
+            "category": "desk",
+            "quantity": 1,
+        }]
+        apply_refinement(d, classify_refinement("make the desk bigger"))
+        assert d["_refinement"]["changed"], "a larger desk exists and must be used"
+        assert not d["_refinement"].get("note")
+
     def test_unknown_request_changes_nothing(self):
         d = _design()
         apply_refinement(d, classify_refinement("asdfgh"))

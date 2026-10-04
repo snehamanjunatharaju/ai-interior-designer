@@ -18,6 +18,7 @@ Every agent is independently testable and emits an AgentStep for streaming.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import time
@@ -38,17 +39,56 @@ from app.core.schemas import (
 )
 from app.engine.brief import BriefConstraints, parse_brief
 from app.engine.pricing import build_phased_plan, price_design
+from app.engine.contracts import (
+    validate_proposal as validate_selection,
+    selections_to_furniture,
+)
 from app.engine.validator import validate_design
 from app.services.llm_provider import extract_json, registry
 from app.services.retrieval import retrieval_service
 
 logger = get_logger(__name__)
 
+# How many consecutive revisions may fail to improve before the reflection
+# loop gives up. One flat round is normal - the model may be addressing a
+# different violation - but two in a row means it is not converging.
+STALL_LIMIT = 2
+
 DESIGNER_SYSTEM_PROMPT = """You are a senior interior designer with 15 years of \
 experience in the Indian residential market. You have deep knowledge of Vastu, Indian \
 climates, space constraints of Indian apartments, local brands, and INR pricing. You \
 give specific, actionable, practical advice - never generic platitudes. You always \
 respond with valid JSON and no other text."""
+
+
+def _decode_entities(value: str) -> str:
+    """
+    Turn HTML entities the model leaks into its prose back into characters.
+
+    gemma2:2b frequently writes `&quot;` when quoting a client requirement
+    instead of a real quote mark. Left alone it reaches the user verbatim in
+    the pros and the layout description.
+    """
+    if "&" not in value:
+        return value
+    try:
+        return html.unescape(value)
+    except Exception:  # pragma: no cover - unescape is effectively total
+        return value
+
+
+def _render_mapping(value: Dict[str, Any]) -> str:
+    """Render a model-produced object as readable prose, not raw JSON."""
+    lines: List[str] = []
+    for key, val in value.items():
+        if val is None or val == "" or val == []:
+            continue
+        rendered = _text(val)
+        if not rendered:
+            continue
+        label = str(key).replace("_", " ").strip()
+        lines.append(f"{label}: {rendered}")
+    return ". ".join(lines)
 
 
 def _text(value: Any, limit: int = 0) -> str:
@@ -63,9 +103,16 @@ def _text(value: Any, limit: int = 0) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        out = value
+        out = _decode_entities(value)
     elif isinstance(value, (int, float, bool)):
         out = str(value)
+    elif isinstance(value, dict):
+        # Models sometimes answer a prose field with an object. Dumping it as
+        # JSON puts raw `{"name": ...}` in front of the user, so render the
+        # useful fields as readable lines instead.
+        out = _render_mapping(value)
+    elif isinstance(value, (list, tuple)):
+        out = "; ".join(_text(v) for v in value if v is not None)
     else:
         try:
             out = json.dumps(value, default=str)
@@ -391,12 +438,31 @@ MANDATORY REQUIREMENTS (checked by code after you respond):
 {revision_block}
 
 Produce the complete design as JSON. Give every furniture item a real `sku`
-from the catalog above. Do not write prices - code applies them."""
+from the catalog above, copied verbatim. Do not write prices anywhere in your
+answer - the `price` field is not part of the schema and code applies prices
+from the catalog. An item whose SKU is not in the list above is discarded."""
 
         with tracer.start("agent.architect", revision=revision):
             try:
                 result = await self._call_llm(prompt, temperature=0.8)
-                design = result["json"] if isinstance(result["json"], dict) else {}
+                raw = result["json"] if isinstance(result["json"], dict) else {}
+                # Validate the selection against the catalog before anything
+                # downstream sees it. An invented SKU is dropped here rather
+                # than becoming an unpriceable, unbought line item.
+                proposal, problems = validate_selection(raw)
+                if proposal is not None:
+                    design = raw
+                    design["furniture"] = selections_to_furniture(proposal)
+                    if proposal.color_palette is not None:
+                        design["color_palette"] = proposal.color_palette.model_dump()
+                    # Prose strings are also trimmed to their validated lengths.
+                    design["title"] = proposal.title
+                    design["concept"] = proposal.concept
+                    design["layout_description"] = proposal.layout_description
+                else:
+                    for problem in problems[:5]:
+                        logger.warning("architect_selection_rejected %s", problem)
+                    design = raw
             except Exception as exc:
                 logger.warning("architect_failed error=%s", exc)
                 design = self._fallback_design(request, plan, brief)
@@ -445,25 +511,58 @@ from the catalog above. Do not write prices - code applies them."""
             room_dimensions=request.room_dimensions or "",
         )
 
-        furniture: List[Dict[str, Any]] = []
-        for category, qty in brief.required_items.items():
-            options = find_products(category)
-            if not options:
-                continue
-            # Cheapest viable option first: a fallback that overspends the
-            # budget helps nobody.
-            product = options[0]
-            for _ in range(max(1, qty)):
-                furniture.append({
-                    "name": product.name,
-                    "category": product.category,
-                    "sku": product.sku,
-                    "quantity": 1,
-                })
+        # The fallback used to take `find_products(category)[0]` per required
+        # category and ignore the budget completely, so a Rs 10,000 brief
+        # produced a Rs 18,200 room that the validator then (correctly)
+        # rejected. The design the user saw by default was always invalid.
+        # Route it through the optimizer, which respects the budget and falls
+        # back to the essentials when the brief is unaffordable.
+        from app.engine.budget_optimizer import optimize_to_budget
 
-        if not furniture:
-            # Nothing was requested, so propose a coherent starter set for the
-            # room type rather than shipping an empty room.
+        required = dict(brief.required_items)
+        optional = {k: 1 for k in (brief.optional_items or ())}
+        if not required:
+            from app.engine.brief import ROOM_CATEGORIES
+            required = {c: 1 for c in list(ROOM_CATEGORIES.get(brief.room_type, ()))[:3]}
+
+        optimised = optimize_to_budget(
+            required=required,
+            budget_inr=brief.budget_inr,
+            optional=optional,
+            style_tier=request.budget.value,
+        )
+        furniture: List[Dict[str, Any]] = [
+            {
+                "name": sel["name"],
+                "category": sel["category"],
+                "sku": sel["sku"],
+                "quantity": sel["quantity"],
+                "brand_suggestions": [sel["brand"]],
+            }
+            for sel in optimised["selections"]
+        ]
+        # Record *why* anything is absent, so the validator reports a budget
+        # constraint rather than accusing the model of forgetting an item.
+        _budget_infeasible = None
+        budget_note = None
+        if not optimised["feasible"]:
+            _budget_infeasible = {
+                "unserved": optimised["unserved"],
+                "shortfall_inr": optimised["shortfall_inr"],
+                "budget_inr": optimised["budget_inr"],
+                "message": optimised["infeasible"],
+                "options": optimised["options"],
+            }
+            budget_note = optimised["infeasible"]
+
+        if not furniture and brief.budget_inr is None:
+            # No budget was stated and nothing was requested, so propose a
+            # coherent starter set rather than shipping an empty room.
+            #
+            # Gated on "no budget given" deliberately: when a budget *was*
+            # stated and nothing fits, adding unbudgeted items here silently
+            # broke the budget the optimizer had just honoured - a Rs 2,000
+            # brief came back with a Rs 7,700 room.
             from app.engine.brief import ROOM_CATEGORIES
             for category in ROOM_CATEGORIES.get(brief.room_type, ())[:3]:
                 options = find_products(category)
@@ -473,11 +572,27 @@ from the catalog above. Do not write prices - code applies them."""
                         "name": product.name, "category": product.category,
                         "sku": product.sku, "quantity": 1,
                     })
+        elif not furniture and brief.budget_inr is not None:
+            # A budget was given and nothing is affordable. Saying so beats
+            # inventing furniture the client cannot buy.
+            if not budget_note:
+                budget_note = (
+                    f"Nothing in this brief is affordable within "
+                    f"Rs {brief.budget_inr:,}. The cheapest items available start "
+                    f"above that figure."
+                )
+                _budget_infeasible = {
+                    "unserved": optimised["unserved"],
+                    "shortfall_inr": optimised["shortfall_inr"],
+                    "budget_inr": optimised["budget_inr"],
+                    "message": budget_note,
+                    "options": optimised["options"],
+                }
 
         room = request.room_type.value.replace("_", " ").title()
         listed = ", ".join(f["name"] for f in furniture[:4]) or "the essential pieces"
 
-        return {
+        fallback = {
             "title": f"{request.style.value.title()} {room}",
             "concept": (
                 f"A practical, well-organised {room.lower()} built around "
@@ -511,11 +626,18 @@ from the catalog above. Do not write prices - code applies them."""
                 "Every item is a real catalog product with a verifiable price",
                 "Fits a constrained budget without inventing a number",
             ],
-            "cons": [
-                "Prose is generic because this design was assembled by the "
-                "fallback path rather than written by the design agent",
-            ],
+            "cons": (
+                [budget_note] if _budget_infeasible else
+                [
+                    "Prose is generic because this design was assembled by the "
+                    "fallback path rather than written by the design agent",
+                ]
+            ),
+            # Carried through so the validator can distinguish "the model forgot
+            # an item" from "the budget could not buy this item".
+            "_budget_infeasible": _budget_infeasible,
         }
+        return fallback
 
 
 class BudgetAgent(BaseAgent):
@@ -850,6 +972,89 @@ class DesignPipeline:
         # response reports reality rather than the configured default.
         self._last_model = settings.DEFAULT_MODEL
 
+    @staticmethod
+    def catalog_has(sku: str) -> bool:
+        """True when `sku` names a product that exists in the catalog."""
+        from app.catalog import catalog
+
+        sku = (sku or "").strip()
+        return bool(sku) and catalog.get(sku) is not None
+
+    @staticmethod
+    def _repair_invented_sku(item: Dict[str, Any]) -> None:
+        """
+        Replace a SKU the model made up with a real catalog product.
+
+        The architect is asked to pick from a catalog list, and gemma2:2b
+        sometimes invents a plausible-looking code instead ("CHR-01"). An
+        invented code cannot be priced, cannot be measured, and cannot be
+        bought, so the line would otherwise reach the client as an
+        unverifiable product. Matching on the item's name finds the real SKU,
+        and the category narrows the search.
+        """
+        from app.catalog import catalog
+        from app.engine.brief import BRIEF_TO_CATALOG_CATEGORY
+
+        name = str(item.get("name", "")).strip()
+        if not name:
+            return
+
+        category = str(item.get("category", "")).strip().lower()
+        mapped = BRIEF_TO_CATALOG_CATEGORY.get(category) or category
+        # The mapping's value is a set of category names.
+        categories = (
+            {str(c).lower() for c in mapped}
+            if isinstance(mapped, (set, list, tuple))
+            else {str(mapped).lower()}
+        )
+        pool = [p for p in catalog.all() if p.category.lower() in categories]
+        if not pool:
+            pool = catalog.all()
+
+        # When the model echoes the SKU back as the name ("name": "CHR-01"), there are
+        # no words to match on. The category still identifies the product, so
+        # fall back to the catalog's own name for that category. A name that is
+        # just a code (letters, digits and separators) is treated the same way,
+        # because that is not a product name either.
+        if name.upper() == str(item.get("sku", "")).strip().upper():
+            product = min(pool, key=lambda p: p.price_inr)
+            logger.info(
+                "invented_sku_replaced invented=%s resolved=%s (sku echoed as name)",
+                item.get("sku"), product.sku,
+            )
+            item["sku"] = product.sku
+            item["name"] = product.name
+            item["category"] = product.category
+            item.setdefault("brand_suggestions", [product.brand])
+            item["width_cm"] = product.width_cm
+            item["depth_cm"] = product.depth_cm
+            item["height_cm"] = product.height_cm
+            return
+
+        def score(product: Any) -> int:
+            pname = str(product.name).lower()
+            if pname == name.lower():
+                return 0
+            # Prefer a name that contains the model's, or is contained by it.
+            if name.lower() in pname or pname in name.lower():
+                return 1
+            words = {w for w in name.lower().split() if len(w) > 2}
+            return 2 + len(words - {w for w in pname.split() if len(w) > 2})
+
+        best = min(pool, key=score)
+        if score(best) <= 2:
+            logger.info(
+                "invented_sku_replaced invented=%s resolved=%s name=%s",
+                item.get("sku"), best.sku, best.name,
+            )
+            item["sku"] = best.sku
+            item["name"] = best.name
+            item["category"] = best.category
+            item.setdefault("brand_suggestions", [best.brand])
+            item["width_cm"] = best.width_cm
+            item["depth_cm"] = best.depth_cm
+            item["height_cm"] = best.height_cm
+
     def _normalize_design(
         self, design: Dict[str, Any], constraints: BriefConstraints
     ) -> Dict[str, Any]:
@@ -870,6 +1075,19 @@ class DesignPipeline:
         is left exactly as-is.
         """
         budget = constraints.budget_inr
+        # Repair invented SKUs before costing, so the repaired lines are picked
+        # up by this pricing pass rather than needing a second one. Only an
+        # item that *claims* a SKU and gets it wrong is repaired here; an item
+        # with no SKU at all is left for the validator to report, because
+        # guessing a product for it would invent a line the model never asked
+        # for.
+        for item in design.get("furniture", []) or []:
+            if not isinstance(item, dict):
+                continue
+            claimed = str(item.get("sku", "")).strip()
+            if claimed and not self.catalog_has(claimed):
+                self._repair_invented_sku(item)
+
         costed = price_design(design, budget_inr=budget)
         priced_by_sku = {li["sku"]: li for li in costed["line_items"]}
 
@@ -1061,6 +1279,10 @@ class DesignPipeline:
             last_report = None
 
             for revision in range(settings.MAX_REFLECTION_ROUNDS + 1):
+                # Tracks convergence across rounds so a flat result can end the
+                # loop early instead of spending the full budget on no change.
+                previous_score = -1.0
+                stalled_rounds = 0
                 if revision > 0:
                     yield {
                         "type": "step",
@@ -1133,6 +1355,36 @@ class DesignPipeline:
                 )
                 if not needs_revision or revision >= settings.MAX_REFLECTION_ROUNDS:
                     break
+
+                # Early stop on a flat score. The loop exists to improve the
+                # design; when a revision scores no better than the attempt it
+                # replaced, the model is not converging and another round burns
+                # 60-90s of local inference to return the same thing. This was
+                # the observed behaviour: two full rounds, no change, and the
+                # user waited the whole time for a worse-or-equal result.
+                if revision >= 1 and score <= previous_score:
+                    stalled_rounds += 1
+                    if stalled_rounds >= STALL_LIMIT:
+                        yield {
+                            "type": "step",
+                            "data": AgentStep(
+                                agent="pipeline",
+                                status="info",
+                                message=(
+                                    "Stopping early: the last revision did not improve "
+                                    "on the previous one."
+                                ),
+                                data={
+                                    "stalled": True,
+                                    "last_score": round(score, 2),
+                                    "previous_score": round(previous_score, 2),
+                                },
+                            ).model_dump(),
+                        }
+                        break
+                else:
+                    stalled_rounds = 0
+                previous_score = score
 
             if best is None:
                 raise RuntimeError("pipeline produced no design")
@@ -1305,9 +1557,25 @@ class DesignPipeline:
                     item["brand_suggestions"] = [line["brand"]]
 
         def safe_list(val: Any) -> List[str]:
-            if isinstance(val, list):
-                return [str(v) for v in val if str(v).strip()]
-            return []
+            if not isinstance(val, list):
+                return []
+            out: List[str] = []
+            for v in val:
+                if isinstance(v, dict):
+                    # The model sometimes answers with objects where the prompt
+                    # asked for strings. str(dict) yields a Python repr with
+                    # single quotes, which reaches the client verbatim, so
+                    # flatten it into readable prose instead.
+                    label = v.get("name") or v.get("zone") or v.get("purpose")
+                    if label:
+                        detail = v.get("purpose") or v.get("layout") or v.get("description")
+                        out.append(f"{label}: {detail}" if detail and detail != label else str(label))
+                        continue
+                    out.append(", ".join(f"{k}: {val2}" for k, val2 in v.items()))
+                    continue
+                if str(v).strip():
+                    out.append(str(v))
+            return out
 
         furniture = []
         for item in design.get("furniture", []) or []:

@@ -179,6 +179,38 @@ class TestParseDimensions:
     def test_unparseable(self):
         assert parse_dimensions("a small room").is_known() is False
 
+    def test_centimetres(self):
+        d = parse_dimensions("240cm x 200cm")
+        assert (d.length_cm, d.width_cm) == (240, 200)
+
+    def test_millimetres(self):
+        """
+        A brief copied from an architect's plan arrives in millimetres. This
+        used to be rejected outright, failing the whole layout request.
+        """
+        d = parse_dimensions("1200mm x 1500mm")
+        assert (d.length_cm, d.width_cm) == (150, 120)
+
+    def test_inches(self):
+        d = parse_dimensions("120 in x 96 in")
+        assert abs(d.length_cm - 305) <= 1
+        assert abs(d.width_cm - 244) <= 1
+
+    def test_mixed_units_honour_each_side(self):
+        d = parse_dimensions("1200mm x 150cm")
+        assert (d.length_cm, d.width_cm) == (150, 120)
+
+    def test_metric_value_is_not_degraded_by_a_feet_round_trip(self):
+        """
+        150cm came back as 149 when the exact centimetre value was recomputed
+        from a rounded foot value. A metric brief must not lose precision.
+        """
+        assert parse_dimensions("1200mm x 1500mm").length_cm == 150
+        assert parse_dimensions("3m x 3m").length_cm == 299
+
+    def test_a_single_number_is_not_a_room(self):
+        assert parse_dimensions("12").is_known() is False
+
 
 class TestParseBrief:
     def test_reproduces_the_reported_bug_brief(self, kids_brief):
@@ -457,10 +489,15 @@ class TestValidator:
         report = validate_design(_design(), kids_brief, cost=None)
         assert "no_costing" in _codes(report)
 
-    def test_over_budget_is_a_warning_not_a_block(self, kids_brief):
-        """The negotiator handles overage; it should not fail the design."""
-        # Beds are included so this design is otherwise valid, and the only
-        # thing wrong with it is that it costs more than the budget.
+    def test_over_budget_fails_the_design(self, kids_brief):
+        """
+        An over-budget design is not a passing design.
+
+        This used to be a WARNING while `checks_passed` was incremented, which
+        produced the exact contradiction the product complained about: a green
+        "Pass 7/7" badge sitting directly above a budget warning. Over-budget
+        is now an error, so the badge is forced to agree with the warning.
+        """
         design = _design(furniture=[
             {"name": "Kids Cot", "category": "bed", "quantity": 2,
              "sku": "BED-KID-COT-01"},
@@ -469,7 +506,12 @@ class TestValidator:
         ])
         report = validate_design(design, kids_brief, price_design(design, 1_000))
         assert "over_budget" in _codes(report)
-        assert report.is_valid
+        over = next(v for v in report.violations if v.code == "over_budget")
+        assert over.severity == "error"
+        assert report.is_valid is False
+        # The exact overage must be stated so the reflection loop can act on it.
+        assert "over" in over.message.lower()
+        assert f"{kids_brief.budget_inr:,}" in over.message
 
     def test_pass_rate_reported(self, kids_brief):
         report = validate_design(_design(), kids_brief, price_design(_design(), 10_000))

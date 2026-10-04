@@ -479,6 +479,205 @@ class LLMRegistry:
         return status
 
 
+def _drop_trailing_comma(out: List[str]) -> None:
+    """
+    Remove a comma that sits immediately before the end of the output.
+
+    The comma and the bracket that follows it are usually separated by a
+    newline, so the previously emitted character is rarely the comma itself.
+    """
+    k = len(out) - 1
+    while k >= 0 and out[k].isspace():
+        k -= 1
+    if k >= 0 and out[k] == ",":
+        del out[k:]
+
+
+def _followed_by_colon(text: str, i: int) -> bool:
+    """True when the string starting at `i` is immediately followed by ':'."""
+    j = i + 1
+    while j < len(text):
+        ch = text[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == '"':
+            k = j + 1
+            while k < len(text) and text[k].isspace():
+                k += 1
+            return k < len(text) and text[k] == ":"
+        j += 1
+    return False
+
+
+def _normalize_json_punctuation(text: str) -> str:
+    """
+    Fix the punctuation slips small models make constantly:
+
+      * a trailing comma before a closing brace/bracket - `{"a": 1,}`
+      * a missing comma between two values - `["x" "y"]`
+      * a literal newline or tab inside a string value
+      * a stray quote mark after a colon - `{"a": "key"}
+
+    Each is structural noise in an otherwise complete document. Left alone it
+    costs the entire response, because no JSON parser accepts them and the
+    salvage path then has to discard the whole design. Commas inside string
+    literals are never touched.
+    """
+    out: List[str] = []
+    in_string = False
+    escaped = False
+    # What the scanner last consumed outside a string, used to decide whether a
+    # separator is missing or redundant:
+    #   "open"   - just after { or [      "colon"  - just after :
+    #   "comma"  - just after ,            "value"  - a complete value was read
+    #   "close"  - just after } or ]
+    prev = ""
+    key_pos = False
+    containers: List[str] = []
+    in_object = False
+    i = 0
+    n = len(text)
+
+    def read_string_at(j: int) -> int:
+        """Return the index just past the string literal starting at j."""
+        k = j + 1
+        while k < n:
+            c = text[k]
+            if c == "\\":
+                k += 2
+                continue
+            if c == '"':
+                return k + 1
+            k += 1
+        return n  # unterminated; caller treats as a value
+
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\\":
+                escaped = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                # A string in key position is a key, not a value: it must not
+                # trigger comma insertion before whatever follows.
+                prev = "key" if key_pos else "value"
+                i += 1
+                continue
+            elif ch in "\n\r\t":
+                # A raw newline or tab inside a string is illegal JSON. The
+                # model wrote a multi-line sentence; escape it so the sentence
+                # survives instead of the whole response being discarded.
+                out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[ch])
+                i += 1
+                continue
+            else:
+                out.append(ch)
+                i += 1
+                continue
+
+        if ch.isspace():
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            # An immediately-closing quote right after ":" is a stray pair,
+            # e.g. `{"a": "b"}` written as `{"a": "b": "}`. Drop the empty
+            # pair so the real value that follows can parse.
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            if prev == "colon" and j < n and text[j] == '"':
+                i += 1
+                continue
+            # A string right after a comma or an opening brace is an object key;
+            # inside an array it is a value. Only a value needs a separator
+            # inserted before whatever follows it.
+            is_key_position = (in_object and prev in ("comma", "open")) or (
+                # A quoted name followed by a colon can only be an object key.
+                # A model that forgot an array's closing bracket writes
+                # ["a note", "brands": [...]] - without this the key is read as
+                # another array element and the document never parses.
+                not in_object and _followed_by_colon(text, i)
+            )
+            if prev == "value":
+                out.append(",")
+            in_string = True
+            key_pos = is_key_position
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            # A comma is only valid after a complete value or a closed
+            # container. Anywhere else it is redundant, so drop it.
+            if prev not in ("value", "close"):
+                i += 1
+                continue
+            out.append(ch)
+            prev = "comma"
+            i += 1
+            continue
+
+        if ch in "}]":
+            # Drop a comma that is only there because a value follows nothing.
+            if prev == "comma":
+                _drop_trailing_comma(out)
+            out.append(ch)
+            if containers:
+                containers.pop()
+            in_object = bool(containers) and containers[-1] == "{"
+            prev = "close"
+            i += 1
+            continue
+
+        if ch in "{[":
+            if prev == "value":
+                out.append(",")
+            out.append(ch)
+            # Push the container kind so a string inside "[" is read as a value
+            # rather than a key.
+            containers.append(ch)
+            in_object = ch == "{"
+            prev = "open"
+            i += 1
+            continue
+
+        if ch == ":":
+            if prev != "value":
+                # A key with no name: nothing sensible to repair here.
+                pass
+            out.append(ch)
+            prev = "colon"
+            i += 1
+            continue
+
+        # Bare literal: number, true, false, or null. Read it whole so that a
+        # missing comma is only inserted between values, never inside one.
+        j = i
+        while j < n and text[j] not in ",}]\" \t\r\n:":
+            j += 1
+        token = text[i:j]
+        if token:
+            if prev == "value":
+                out.append(",")
+            out.append(token)
+            prev = "value"
+        i = j if j > i else i + 1
+
+    return "".join(out)
+
+
 def _repair_json(text: str) -> Any:
     """
     Recover a usable object from truncated or malformed JSON.
@@ -622,7 +821,26 @@ def extract_json(text: str) -> Any:
         logger.info("json_repaired truncated_output_recovered")
         return repaired
 
-    raise ValueError(f"could not parse JSON from: {text[:200]}")
+    # Still nothing: the document is structurally complete but carried trailing
+    # commas, which is the most common way a small model emits valid-looking
+    # JSON that no parser accepts. Try once more without them.
+    de_commad = _normalize_json_punctuation(cleaned)
+    if de_commad != cleaned:
+        try:
+            return json.loads(de_commad)
+        except json.JSONDecodeError:
+            pass
+        repaired = _repair_json(de_commad)
+        if repaired is not None:
+            logger.info("json_repaired punctuation_normalised")
+            return repaired
+
+    # Report both ends: the head shows the shape the model chose, the tail
+    # shows where generation stopped, which is what distinguishes a truncated
+    # response from prose the model never formatted as JSON at all.
+    raise ValueError(
+        f"could not parse JSON from: {text[:200]} ...[tail]... {text[-200:]}"
+    )
 
 
 registry = LLMRegistry()

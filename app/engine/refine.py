@@ -349,11 +349,44 @@ def apply_refinement(
         from app.engine.brief import canonical_item_for as _canon
         options = catalog_lookup(_canon(current_word))
         if options:
-            current_area = None
-            for o in options:
-                if current_word.lower() in str(o.name).lower():
-                    current_area = o.width_cm * o.depth_cm
+            furniture = design.get("furniture", [])
+            if not isinstance(furniture, list):
+                furniture = []
+
+            # Identify the item actually being resized first, then use its own
+            # catalog size as the baseline. Searching the catalog by the word
+            # "desk" found "Study Desk 120cm" even when the design held the
+            # 90cm kids table, so "bigger" resized from the wrong baseline and
+            # could report no change while a larger option existed.
+            target = None
+            for f in furniture:
+                if not isinstance(f, dict):
+                    continue
+                sku = str(f.get("sku", "")).strip()
+                if sku and any(o.sku == sku for o in options):
+                    target = f
                     break
+            if target is None:
+                for f in furniture:
+                    if isinstance(f, dict) and current_word.lower() in str(
+                        f.get("name", "")
+                    ).lower():
+                        target = f
+                        break
+
+            current_area: Optional[int] = None
+            if target is not None:
+                sku = str(target.get("sku", "")).strip()
+                for o in options:
+                    if o.sku == sku:
+                        current_area = o.width_cm * o.depth_cm
+                        break
+            if current_area is None:
+                for o in options:
+                    if current_word.lower() in str(o.name).lower():
+                        current_area = o.width_cm * o.depth_cm
+                        break
+
             pool = [
                 o for o in options
                 if (o.width_cm * o.depth_cm) > (current_area or 0)
@@ -366,18 +399,24 @@ def apply_refinement(
                 product = sorted(pool, key=lambda i: abs(
                     i.width_cm * i.depth_cm - (current_area or 0)
                 ))[0]
-                furniture = design.get("furniture", [])
-                if isinstance(furniture, list):
-                    for f in furniture:
-                        if isinstance(f, dict) and current_word.lower() in str(
-                            f.get("name", "")
-                        ).lower():
-                            f["name"] = product.name
-                            f["sku"] = product.sku
-                            f["category"] = product.category
-                            f["brand_suggestions"] = [product.brand]
-                            changed.append(f"resized to {product.name}")
-                            break
+                if target is not None:
+                    target["name"] = product.name
+                    target["sku"] = product.sku
+                    target["category"] = product.category
+                    target["brand_suggestions"] = [product.brand]
+                    changed.append(f"resized to {product.name}")
+            if not changed:
+                # Nothing in the catalog is larger (or smaller) than what is
+                # already there. Say so rather than reporting a resize that
+                # changed nothing, which reads as a broken button.
+                note = (
+                    f"{current_word} is already the largest {current_word} in "
+                    f"the catalog."
+                    if bigger else
+                    f"{current_word} is already the smallest {current_word} in "
+                    f"the catalog."
+                )
+                design.setdefault("_refinement", {})["note"] = note
 
     elif intent.target == TARGET_LIGHTING:
         design["lighting_plan"] = (

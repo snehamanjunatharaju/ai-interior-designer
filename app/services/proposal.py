@@ -36,6 +36,7 @@ from reportlab.platypus import (
 )
 
 from app.core.observability import get_logger
+import os
 
 logger = get_logger(__name__)
 
@@ -67,29 +68,105 @@ CATEGORY_FILL = {
 
 def _styles() -> Dict[str, ParagraphStyle]:
     base = getSampleStyleSheet()
+    # Every style uses the Unicode font when one is available, so the rupee
+    # sign renders in body text and table cells, not only in headline figures.
+    uni = _unicode_font()
+    family = {"fontName": uni} if uni else {}
+    bold = {"fontName": uni} if uni else {"fontName": "Helvetica-Bold"}
     return {
         "title": ParagraphStyle("t", parent=base["Title"], fontSize=22,
-                                textColor=INK, spaceAfter=2, alignment=TA_LEFT),
+                                textColor=INK, spaceAfter=2, alignment=TA_LEFT,
+                                **bold),
         "sub": ParagraphStyle("s", parent=base["Normal"], fontSize=9.5,
-                              textColor=MUTED, spaceAfter=10),
+                              textColor=MUTED, spaceAfter=10, **family),
         "h2": ParagraphStyle("h2", parent=base["Heading2"], fontSize=13,
-                             textColor=INK, spaceBefore=12, spaceAfter=5),
+                             textColor=INK, spaceBefore=12, spaceAfter=5, **bold),
         "body": ParagraphStyle("b", parent=base["Normal"], fontSize=9.5,
-                               textColor=INK, leading=13.5),
+                               textColor=INK, leading=13.5, **family),
         "small": ParagraphStyle("sm", parent=base["Normal"], fontSize=8,
-                                textColor=MUTED, leading=11),
+                                textColor=MUTED, leading=11, **family),
         "cell": ParagraphStyle("c", parent=base["Normal"], fontSize=8.5,
-                               textColor=INK),
+                               textColor=INK, **family),
         "cellb": ParagraphStyle("cb", parent=base["Normal"], fontSize=8.5,
-                                textColor=INK, fontName="Helvetica-Bold"),
+                                textColor=INK, **bold),
     }
 
 
 def _rupee(n: Any) -> str:
+    """
+    Single money format for the whole document - see app.core.money.
+
+    Falls back to the `Rs` prefix when no Unicode font is available, because
+    the base-14 fonts render `₹` as a stray `n`.
+    """
+    from app.core.money import format_inr
+
+    if _unicode_font() is None:
+        try:
+            return "Rs {:,}".format(int(n or 0))
+        except (TypeError, ValueError):
+            return "Rs 0"
+    return format_inr(n)
+
+
+# ---------------------------------------------------------------------------
+# Font selection
+# ---------------------------------------------------------------------------
+# ReportLab's built-in Type 1 fonts (Helvetica and friends) are Latin-1 only:
+# the rupee sign has no glyph and is emitted as a literal "n". The proposal was
+# therefore printing "n 14,500" on every price, which is not a formatting
+# detail - it makes the document unusable and, worse, looks like a real figure
+# at a glance.
+#
+# A Unicode TTF is resolved once, from a candidate list, and cached. If none is
+# present the document falls back to the word "Rs", which at least renders
+# correctly rather than as a stray letter.
+
+_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/NotoSans-Regular.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+)
+
+_font_cache: Dict[str, Any] = {}
+
+
+def _unicode_font() -> Optional[str]:
+    """
+    Register and return a font that can draw the rupee sign.
+
+    Returns None when no candidate exists, which is the signal to fall back to
+    the "Rs" prefix rather than render a broken glyph.
+    """
+    if "name" in _font_cache:
+        return _font_cache["name"]
     try:
-        return "Rs {:,}".format(int(n or 0))
-    except (TypeError, ValueError):
-        return "Rs 0"
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        for path in _FONT_CANDIDATES:
+            if not os.path.isfile(path):
+                continue
+            try:
+                # Verify the glyph is actually present. A font can be Unicode
+                # and still lack U+20B9, and registering it would give a
+                # different wrong answer rather than the right one.
+                pdfmetrics.registerFont(TTFont("InteriorAIUnicode", path))
+                _font_cache["name"] = "InteriorAIUnicode"
+                _font_cache["path"] = path
+                return "InteriorAIUnicode"
+            except Exception:  # pragma: no cover - font-specific
+                continue
+    except Exception:  # pragma: no cover - reportlab import
+        pass
+    _font_cache["name"] = None
+    return None
 
 
 def _footer(canvas, doc):

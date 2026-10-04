@@ -21,6 +21,108 @@ def client():
         yield c
 
 
+class TestProposalPdfEndpoint:
+    """
+    A client proposal that says "Rs 0" is worse than no proposal. The PDF
+    endpoint used to trust an optional `cost` key, so sending only the design
+    produced a zero-valued document.
+    """
+
+    _DESIGN = {
+        "title": "Kids Corner",
+        "options": [{
+            "title": "Option A",
+            "concept": "Calm pastel room",
+            "furniture": [
+                {"name": "Bunk", "sku": "BED-KID-BUNK-01", "quantity": 1},
+                {"name": "Table", "sku": "DSK-KID-01", "quantity": 2},
+            ],
+        }],
+    }
+
+    def _pdf_text(self, pdf_bytes):
+        """
+        Pull the visible strings out of the reportlab stream.
+
+        With a Unicode TTF registered, reportlab emits the rupee sign as a
+        2-byte glyph index (\\000...) rather than the UTF-8 bytes, so the raw
+        text cannot be searched for "₹" directly. The symbol is stripped out
+        and only the digits are asserted on; `test_money_uses_one_format...`
+        covers the symbol itself.
+        """
+        import base64
+        import re
+        import zlib
+
+        chunks = []
+        for match in re.finditer(rb"stream\r?\n(.*?)endstream", pdf_bytes, re.S):
+            raw = match.group(1).strip()
+            try:
+                raw = zlib.decompress(base64.a85decode(raw, adobe=True))
+            except Exception:
+                pass
+            chunks.append(raw.decode("latin1", "replace"))
+        body = "\n".join(chunks)
+        return " ".join(re.findall(r"\((.*?)\)\s*Tj", body))
+
+    def test_prices_are_derived_when_cost_is_omitted(self, client):
+        response = client.post(
+            "/api/v1/proposal.pdf",
+            json={"client_name": "Anita", "design": self._DESIGN},
+        )
+        assert response.status_code == 200
+        assert response.content[:4] == b"%PDF"
+
+        text = self._pdf_text(response.content)
+        assert "Rs 0" not in text, "a proposal must never quote a zero total"
+        assert "n/a" not in text, "catalog version must be resolved"
+        # 14,500 bunk + 2 x 2,100 table
+        assert "18,700" in text
+        # The rupee sign must survive. Helvetica would emit a stray "n" here,
+        # which is the bug this guards against.
+        assert "n14,500" not in text, "rupee sign rendered as a letter"
+
+    def test_money_uses_one_format_with_indian_grouping(self, client):
+        """
+        One currency format everywhere. Indian digit grouping is not cosmetic:
+        ₹1,23,456 is Rs 123,400, and a reader using Western grouping would
+        misread it by two orders of magnitude.
+        """
+        from app.core.money import format_inr
+
+        assert format_inr(4100) == "₹4,100"
+        assert format_inr(123456) == "₹1,23,456"
+        assert format_inr(None) == "₹0"
+        assert format_inr("garbage") == "₹0"
+
+    def test_explicit_cost_is_still_honoured(self, client):
+        design = {"title": "X", "furniture": [
+            {"name": "Bunk", "sku": "BED-KID-BUNK-01", "quantity": 1},
+        ]}
+        response = client.post(
+            "/api/v1/proposal.pdf",
+            json={
+                "design": design,
+                "cost": {
+                    "estimated_cost_inr": 999999,
+                    "catalog_version": "test-version",
+                },
+            },
+        )
+        assert response.status_code == 200
+        text = self._pdf_text(response.content)
+        # Indian digit grouping: 999,999 renders as 9,99,999. Asserting the
+        # exact string also guards the grouping itself, which is the point.
+        assert "9,99,999" in text
+        assert "test-version" in text
+        # The caller's figure is honoured, and code filled in the shopping list
+        # the caller omitted.
+        assert "Bunk" in text
+
+    def test_still_rejects_a_missing_design(self, client):
+        assert client.post("/api/v1/proposal.pdf", json={}).status_code == 422
+
+
 class TestHealthEndpoints:
     def test_health_returns_200(self, client):
         response = client.get("/api/v1/health")
