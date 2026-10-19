@@ -165,11 +165,22 @@ class RoomPlan:
                 "width_cm": round(self.width_cm, 1),
                 "depth_cm": round(self.depth_cm, 1),
                 "ceiling_cm": round(self.ceiling_cm, 1),
+                # Both units, because the client gave feet ("9 x 11 ft") and
+                # the plan is drawn in centimetres. A layout that reports only
+                # centimetres makes the client convert it themselves.
+                "width_ft": round(self.width_cm / 30.48, 1),
+                "depth_ft": round(self.depth_cm / 30.48, 1),
+                "area_sqft": round((self.width_cm / 30.48) * (self.depth_cm / 30.48), 1),
+                "ceiling_ft": round(self.ceiling_cm / 30.48, 1),
+                "dimension_text": "{:.1f} x {:.1f} ft".format(
+                    self.width_cm / 30.48, self.depth_cm / 30.48
+                ),
                 "door_direction": self.door_direction,
                 "window_direction": self.window_direction,
             },
             "items": [i.to_dict() for i in self.items],
             "issues": [i.to_dict() for i in self.issues],
+            "zones": zone_sizes(self),
             "unplaced": self.unplaced,
             "score": score_layout(self),
         }
@@ -178,6 +189,41 @@ class RoomPlan:
 # --------------------------------------------------------------------------
 # Geometry helpers
 # --------------------------------------------------------------------------
+
+
+def zone_sizes(plan: RoomPlan) -> List[Dict[str, Any]]:
+    """Approximate size of each functional zone, in feet.
+
+    A zone is the footprint of one category's furniture plus the clearance in
+    front of it. This is an estimate and is labelled as one: it answers "how
+    big is the study corner?" from the plan that was actually drawn, rather
+    than inventing an area the furniture does not occupy.
+    """
+    by_category: Dict[str, List[PlacedItem]] = {}
+    for item in plan.items:
+        by_category.setdefault(item.category, []).append(item)
+
+    zones: List[Dict[str, Any]] = []
+    for category, items in sorted(by_category.items()):
+        min_x = min(i.x for i in items)
+        min_y = min(i.y for i in items)
+        max_x = max(i.right for i in items)
+        max_y = max(i.bottom for i in items)
+        # Add the standing clearance in front of the furniture. The room's
+        # own edge already offers a visual margin, so the estimate is capped
+        # by the floor area rather than extending past the walls.
+        width_cm = min(max_x - min_x + MIN_CLEARANCE_CM, plan.width_cm)
+        depth_cm = min(max_y - min_y + MIN_CLEARANCE_CM, plan.depth_cm)
+        zones.append({
+            "category": category,
+            "label": category.replace("_", " ").title(),
+            "items": [i.name for i in items],
+            "approx_width_ft": round(width_cm / 30.48, 1),
+            "approx_depth_ft": round(depth_cm / 30.48, 1),
+            "approx_area_sqft": round((width_cm / 30.48) * (depth_cm / 30.48), 1),
+            "note": "footprint plus clearance, estimated from the plan",
+        })
+    return zones
 
 
 def rectangles_overlap(a: PlacedItem, b: PlacedItem) -> bool:

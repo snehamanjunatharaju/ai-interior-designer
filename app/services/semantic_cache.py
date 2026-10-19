@@ -57,8 +57,29 @@ class SemanticCache:
 
     @staticmethod
     def make_key(payload: Dict[str, Any]) -> str:
-        """Stable hash of a request payload for the exact-match fast path."""
-        normalized = json.dumps(payload, sort_keys=True, default=str)
+        """
+        Stable hash of the request payload, plus everything that would make a
+        stored answer wrong.
+
+        The original key hashed the payload alone, so a cached design survived
+        changes that invalidate it completely: a catalog reprice, or switching
+        from gemma2:2b to llama3.1:8b. Both served a stale answer silently -
+        no error, just numbers that no longer matched the database. Two briefs
+        differing only in a field the caller forgot to pass also collided.
+
+        So the key is the payload *plus* the catalog version and the model that
+        produced it. A change in either invalidates every entry, which is the
+        only safe behaviour: a cache miss costs one LLM call, while a wrong
+        cache hit costs the client their trust.
+        """
+        from app.catalog import catalog
+
+        envelope = {
+            "payload": payload,
+            "catalog_version": catalog.version(),
+            "model": settings.DEFAULT_MODEL,
+        }
+        normalized = json.dumps(envelope, sort_keys=True, default=str)
         return hashlib.blake2b(normalized.encode("utf-8"), digest_size=16).hexdigest()
 
     def get(self, payload: Dict[str, Any], vector: np.ndarray) -> Optional[Dict[str, Any]]:

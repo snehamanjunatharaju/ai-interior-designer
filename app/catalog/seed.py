@@ -27,6 +27,34 @@ from app.catalog.store import (
     CatalogItem,
 )
 
+# Room types each catalog category belongs to.
+#
+# Categories not listed here are universal (a lamp, a rug, paint). The list
+# exists because a kitchen brief used to be able to buy a kids' study table
+# and a bean bag: the model was shown a catalog with no notion of *where* a
+# product belongs, so nothing stopped it. Filtering is applied on the way into
+# the prompt (`room_catalog`) and again by the validator.
+CATEGORY_ROOMS: dict[str, tuple[str, ...]] = {
+    "bed": ("bedroom", "kids_room"),
+    "mattress": ("bedroom", "kids_room"),
+    "desk": ("kids_room", "home_office", "bedroom"),
+    "chair": ("kids_room", "home_office", "dining", "bedroom"),
+    "wardrobe": ("bedroom", "kids_room"),
+    "tv_unit": ("living_room", "bedroom"),
+    "storage": ("bedroom", "kids_room", "home_office", "living_room", "kitchen"),
+    "seating": ("living_room", "balcony", "bedroom", "kids_room"),
+    "table": ("living_room", "dining", "bedroom", "home_office"),
+    "kitchen": ("kitchen", "dining"),
+}
+
+# Who each category is for, independent of room. A bean bag or a coffee table
+# is furniture for a living room, not for a kitchen, whatever the audience.
+CATEGORY_AUDIENCE: dict[str, str] = {}
+
+# Everyday names -> SKU. Used by price lookup and by the refine step, so
+# "chimney" and "countertop" resolve to the catalogue product a client means.
+ITEM_ALIASES: dict[str, str] = {}
+
 SEED_ITEMS: list[CatalogItem] = [
     # ======================================================================
     # Beds - kids and single
@@ -35,13 +63,13 @@ SEED_ITEMS: list[CatalogItem] = [
         "BED-KID-COT-01", "Kids Single Cot 90cm", "bed", "Sleepwell",
         3200, 90, 190, 60, TIER_ESSENTIAL,
         "https://www.sleepwell.com/",
-        "Low bed height suits children; safety rail recommended",
+        "Low bed height suits children; safety rail recommended", audience="kids"
     ),
     CatalogItem(
         "BED-KID-BUNK-01", "Kids Bunk Bed (upper + lower)", "bed", "Sleepwell",
         14500, 100, 200, 160, TIER_UPGRADE,
         "https://www.sleepwell.com/",
-        "Frees floor space; ladder on the wall side", 2,
+        "Frees floor space; ladder on the wall side", 2, audience="kids"
     ),
     CatalogItem(
         "BED-SGL-PLY-01", "Single Bed - Plywood with Storage", "bed", "Urban Ladder",
@@ -67,7 +95,7 @@ SEED_ITEMS: list[CatalogItem] = [
     CatalogItem(
         "MAT-KID-01", "Kids Mattress 2in - Comfort", "mattress", "Kurlon",
         2500, 80, 160, 8, TIER_ESSENTIAL,
-        "https://www.kurlon.com/",
+        "https://www.kurlon.com/", audience="kids"
     ),
 
     # ======================================================================
@@ -77,7 +105,7 @@ SEED_ITEMS: list[CatalogItem] = [
         "DSK-KID-01", "Kids Study Table 90cm", "desk", "Hometown",
         2100, 90, 55, 72, TIER_ESSENTIAL,
         "https://www.hometownfurniture.com/",
-        "Height 72cm suits ages 6-12; pairs with a 32cm chair",
+        "Height 72cm suits ages 6-12; pairs with a 32cm chair", audience="kids"
     ),
     CatalogItem(
         "DSK-STD-01", "Study Desk 120cm with Drawer", "desk", "Urban Ladder",
@@ -92,7 +120,7 @@ SEED_ITEMS: list[CatalogItem] = [
     CatalogItem(
         "CHR-KID-01", "Kids Chair - Ergonomic", "chair", "Hometown",
         1400, 38, 45, 60, TIER_ESSENTIAL,
-        "https://www.hometownfurniture.com/",
+        "https://www.hometownfurniture.com/", audience="kids"
     ),
     CatalogItem(
         "CHR-OFF-01", "Office Chair - Mesh Back", "chair", "Green Laundry",
@@ -133,7 +161,7 @@ SEED_ITEMS: list[CatalogItem] = [
     CatalogItem(
         "CHV-STO-01", "Toy Storage Chest - 70cm", "storage", "Hometown",
         1800, 70, 40, 45, TIER_ESSENTIAL,
-        "https://www.hometownfurniture.com/",
+        "https://www.hometownfurniture.com/", audience="kids"
     ),
     CatalogItem(
         "STO-CHV-01", "Cube Storage - 5 Cubes", "storage", "Urban Ladder",
@@ -159,10 +187,13 @@ SEED_ITEMS: list[CatalogItem] = [
         9500, 75, 80, 80, TIER_UPGRADE,
         "https://www.sleepcat.in/",
     ),
+    # Domestic bean bags are sold by upholstery/ready-made brands, not by
+    # furnishing retailers - Fabindia selling one was exactly the kind of
+    # invented brand association that made the list untrustworthy.
     CatalogItem(
-        "BEAN-01", "Bean Bag - Large", "seating", "Fabindia",
+        "BEAN-01", "Bean Bag - Large", "seating", "Wakefit",
         3500, 90, 90, 70, TIER_ESSENTIAL,
-        "https://www.fabindia.com/",
+        "https://www.wakefit.co/",
     ),
     CatalogItem(
         "STL-01", "Stool - Wood, 45cm", "seating", "Urban Ladder",
@@ -216,7 +247,7 @@ SEED_ITEMS: list[CatalogItem] = [
         "RUG-KID-01", "Kids Round Rug 150cm", "soft", "Hometown",
         1400, 150, 150, 2, TIER_ESSENTIAL,
         "https://www.hometownfurniture.com/",
-        "Anti-skid backing recommended on smooth tile",
+        "Anti-skid backing recommended on smooth tile", audience="kids"
     ),
     CatalogItem(
         "RUG-LIV-01", "Living Room Rug 240x170cm", "soft", "Urban Ladder",
@@ -227,12 +258,12 @@ SEED_ITEMS: list[CatalogItem] = [
         "CUR-KID-01", "Curtains - Blackout, Per Pair", "soft", "Jockey",
         1300, 140, 2, 220, TIER_ESSENTIAL,
         "https://www.jockey.com/",
-        "Blackout for a child's room controls the 7am wake-up problem",
+        "Blackout for a child's room controls the 7am wake-up problem", audience="kids"
     ),
     CatalogItem(
         "QUIL-KID-01", "Kids Quilt - Cotton", "soft", "Fabindia",
         1100, 100, 150, 5, TIER_ESSENTIAL,
-        "https://www.fabindia.com/",
+        "https://www.fabindia.com/", audience="kids"
     ),
 
     # ======================================================================
@@ -258,7 +289,7 @@ SEED_ITEMS: list[CatalogItem] = [
         "DEC-DSL-01", "Wall Decal Set - Kids", "decor", "Wallsta",
         600, 120, 1, 100, TIER_ESSENTIAL,
         "https://www.wallsta.com/",
-        "Removable adhesive vinyl; renter friendly",
+        "Removable adhesive vinyl; renter friendly", audience="kids"
     ),
     CatalogItem(
         "DEC-BIN-01", "Laundry Hamper - Bamboo", "decor", "Urban Ladder",
@@ -303,19 +334,98 @@ SEED_ITEMS: list[CatalogItem] = [
     # ======================================================================
     # Modular kitchen (kept small - a kids room brief should not match these)
     # ======================================================================
+    # Brands are the ones that actually sell each product. Hettich makes
+    # hinges and carcass hardware, not countertops; a countertop brand is a
+    # stone/premium-surface supplier such as KalingaStone, and a sink is a
+    # plumbing brand such as Jaquar.
     CatalogItem(
         "KIT-BSE-01", "Modular Kitchen Base Unit 3ft", "kitchen", "Hettich",
         18000, 90, 60, 85, TIER_UPGRADE,
         "https://www.hettich.com/",
+        "Carcass plus soft-close hardware; corner unit available",
     ),
     CatalogItem(
-        "KIT-CNT-01", "Kitchen Countertop - Per 3ft", "kitchen", "Hettich",
+        "KIT-CNT-01", "Kitchen Countertop - Per 3ft", "kitchen", "KalingaStone",
         9500, 90, 60, 4, TIER_UPGRADE,
-        "https://www.hettich.com/",
+        "https://www.kalingastone.com/",
+        "Quartz slab; cut-out for sink and hob priced separately",
     ),
     CatalogItem(
-        "KIT-SNK-01", "Kitchen Sink with Tap", "kitchen", "Hettich",
+        "KIT-SNK-01", "Kitchen Sink with Tap", "kitchen", "Jaquar",
         6500, 60, 45, 20, TIER_UPGRADE,
-        "https://www.hettich.com/",
+        "https://www.jaquar.com/",
+    ),
+    CatalogItem(
+        "KIT-OVC-01", "Overhead Wall Cabinet 3ft", "kitchen", "Godrej Interio",
+        12500, 90, 35, 70, TIER_UPGRADE,
+        "https://www.godrejinterio.com/",
+        "Wall-hung; set 45-55cm above the countertop",
+    ),
+    CatalogItem(
+        "KIT-SHLF-01", "Open Kitchen Shelf 3ft", "kitchen", "Nilkamal",
+        2200, 90, 25, 4, TIER_ESSENTIAL,
+        "https://www.nilkamalfurniture.com/",
+        "For daily-use jars and crockery; keep below eye level",
+    ),
+    CatalogItem(
+        "KIT-PNT-01", "Tall Pantry Unit", "kitchen", "Godrej Interio",
+        16500, 60, 60, 210, TIER_UPGRADE,
+        "https://www.godrejinterio.com/",
+        "Pull-out baskets; holds a month of dry groceries",
+    ),
+    CatalogItem(
+        "KIT-TRL-01", "Kitchen Trolley - 3 Tier", "kitchen", "Nilkamal",
+        1900, 45, 40, 80, TIER_ESSENTIAL,
+        "https://www.nilkamalfurniture.com/",
+        "Wheels; doubles as a serving cart",
+    ),
+    CatalogItem(
+        "KIT-EXH-01", "Auto-Clean Chimney 60cm", "kitchen", "Elica",
+        13500, 60, 45, 60, TIER_UPGRADE,
+        "https://www.elica.com/",
+        "Essential for Indian cooking; mount 65cm above the hob",
+    ),
+    CatalogItem(
+        "KIT-FAN-01", "Kitchen Exhaust Fan 250mm", "kitchen", "Bajaj",
+        2200, 30, 30, 30, TIER_ESSENTIAL,
+        "https://www.bajaj.com/",
+        "Budget alternative to a chimney; needs a wall opening",
+    ),
+    CatalogItem(
+        "KIT-BSP-01", "Kitchen Backsplash - Per 3ft", "kitchen", "KalingaStone",
+        3200, 90, 2, 60, TIER_STANDARD,
+        "https://www.kalingastone.com/",
+        "Wipe-clean surface behind the hob; up to 60cm tall",
+    ),
+    CatalogItem(
+        "KIT-LGT-01", "Under-Cabinet Task Light 60cm", "kitchen", "Wipro",
+        1100, 60, 5, 2, TIER_ESSENTIAL,
+        "https://www.wiproconsumerlighting.com/",
+        "4000K LED; lights the countertop, not the ceiling",
     ),
 ]
+
+# Everyday names a brief, the model, or a refine request uses.
+ITEM_ALIASES.update({
+    "chimney": "KIT-EXH-01",
+    "kitchen chimney": "KIT-EXH-01",
+    "exhaust": "KIT-FAN-01",
+    "exhaust fan": "KIT-FAN-01",
+    "overhead cabinet": "KIT-OVC-01",
+    "overhead cabinets": "KIT-OVC-01",
+    "wall cabinet": "KIT-OVC-01",
+    "open shelf": "KIT-SHLF-01",
+    "open shelves": "KIT-SHLF-01",
+    "pantry": "KIT-PNT-01",
+    "pantry unit": "KIT-PNT-01",
+    "trolley": "KIT-TRL-01",
+    "kitchen trolley": "KIT-TRL-01",
+    "backsplash": "KIT-BSP-01",
+    "back splash": "KIT-BSP-01",
+    "countertop": "KIT-CNT-01",
+    "granite counter": "KIT-CNT-01",
+    "sink": "KIT-SNK-01",
+    "base unit": "KIT-BSE-01",
+    "bean bag": "BEAN-01",
+    "beanbag": "BEAN-01",
+})

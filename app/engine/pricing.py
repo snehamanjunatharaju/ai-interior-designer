@@ -54,21 +54,22 @@ def price_design(
 
     for entry in furniture:
         sku = str(entry.get("sku", "")).strip()
-        item = catalog.get(sku) if sku else None
+        # Exact SKU, then exact catalog name, then an explicit alias. Name
+        # resolution used to be an exact-match scan over the catalog, so a
+        # model that wrote "Kitchen Countertop" while quoting a real SKU of
+        # "KIT-CNT-01" was fine, but an entry that carried only the name was
+        # reported unpriced and reached the client at Rs 0. Both identifiers
+        # now resolve through the same index.
+        resolved_sku = catalog.resolve_sku(sku, str(entry.get("name", "")))
+        item = catalog.get(resolved_sku) if resolved_sku else None
 
         if item is None:
-            # Try to resolve by name as a courtesy, but never invent a price.
-            name = str(entry.get("name", "")).strip().lower()
-            match = next(
-                (c for c in catalog.all() if c.name.lower() == name), None
-            )
-            if match is None:
-                unpriced_items.append({
-                    "name": str(entry.get("name", "unnamed item")),
-                    "reason": "no catalog SKU and no exact name match",
-                })
-                continue
-            item = match
+            unpriced_items.append({
+                "name": str(entry.get("name", "unnamed item")),
+                "reason": "no catalog SKU and no exact name match",
+            })
+            continue
+        if item.sku != sku:
             # Write the resolved SKU back onto the entry. The line is now
             # genuinely catalog-backed, but without this the validator still
             # sees the empty/invented SKU and reports `uncatalogued_item` for an
@@ -80,6 +81,21 @@ def price_design(
         except (TypeError, ValueError):
             qty = 1
         qty = max(1, qty)
+
+        # A product named twice ("Kids Chair" added by the model and again by
+        # the required-item insert) is one purchase, not two. Merge on SKU and
+        # keep the highest quantity asked for - the lines were not independent
+        # requests.
+        existing = next((p for p in priced_items if p["sku"] == item.sku), None)
+        if existing is not None:
+            existing["quantity"] = max(existing["quantity"], qty)
+            existing["line_total_inr"] = refresh_line_totals([existing])[0]["line_total_inr"]
+            by_category[item.category] = (
+                by_category.get(item.category, 0)
+                - min(existing["quantity"], qty) * item.price_inr
+                + existing["line_total_inr"]
+            )
+            continue
 
         line_total = item.price_inr * qty
         priced_items.append({
@@ -104,7 +120,7 @@ def price_design(
         })
         by_category[item.category] = by_category.get(item.category, 0) + line_total
 
-    total = sum(i["line_total_inr"] for i in priced_items)
+    total = total_inr(priced_items)
 
     breakdown: List[Dict[str, Any]] = []
     for category, amount in sorted(by_category.items(), key=lambda kv: -kv[1]):
@@ -157,6 +173,43 @@ def price_design(
 
     metrics.observe("pricing.total_inr", float(total))
     return result
+
+
+def refresh_line_totals(line_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Recompute every `line_total_inr` from its own unit price and quantity.
+
+    A line whose quantity was edited upstream (the refine step, or the
+    quantity repair in the pipeline) otherwise keeps the stale total it was
+    priced with, and the total then disagrees with its own rows.
+    """
+    for item in line_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("unit_price_inr") is not None:
+            item["line_total_inr"] = int(item["unit_price_inr"] or 0) * int(
+                item.get("quantity") or 1
+            )
+    return line_items
+
+
+def total_inr(line_items: List[Dict[str, Any]]) -> int:
+    """The one total calculation in the system.
+
+    The option card, the edit step, the phased plan and the PDF all reach the
+    client with a number, and they disagreed: an option showed Rs 0 while the
+    edit step said Rs 24,900. Every one of those call sites now calls this
+    function, so they cannot drift apart.
+    """
+    total = 0
+    for item in line_items:
+        if not isinstance(item, dict):
+            continue
+        unit = item.get("unit_price_inr")
+        if unit is None:
+            total += int(item.get("line_total_inr") or 0)
+        else:
+            total += int(unit or 0) * int(item.get("quantity") or 1)
+    return total
 
 
 def required_units_for(

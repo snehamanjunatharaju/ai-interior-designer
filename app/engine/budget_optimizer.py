@@ -69,6 +69,7 @@ def optimize_to_budget(
     budget_inr: Optional[int],
     optional: Optional[Dict[str, int]] = None,
     style_tier: str = "standard",
+    audience: str = "any",
 ) -> OptimisationResult:
     """
     Build the best real shopping list that fits `budget_inr`.
@@ -105,7 +106,7 @@ def optimize_to_budget(
         count = required[category]
         served = 0
         while served < count:
-            options = products_satisfying(category)
+            options = products_satisfying(category, audience=audience)
             if not options:
                 break
             # The tier ceiling deliberately does NOT apply to required items.
@@ -113,16 +114,27 @@ def optimize_to_budget(
             # essential-tier product at all, so applying the ceiling here made
             # an ordinary Rs 1.2L bedroom report itself infeasible. The ceiling
             # governs discretionary *upgrades*, not whether the brief can be met.
-            #
-            # Prefer the option that covers the most sleepers per unit first,
-            # so a two-child brief is satisfied by one bunk bed (Rs 14,500)
-            # rather than two cots (Rs 6,400) when the budget is tight - and,
-            # more importantly, rather than being reported as a shortfall when
-            # the bunk would have fitted.
-            cheapest = min(
-                options,
-                key=lambda p: (-p.sleeps, p.price_inr, p.name),
-            )
+            remaining = count - served
+
+            def value(p: Any) -> tuple:
+                """
+                Rank by value per sleeper, then by whether one unit covers
+                what is still needed.
+
+                Sorting by `sleeps` first handed a *single* child's bed the
+                Rs 14,500 bunk instead of the Rs 3,200 cot - 4x the price for
+                one occupant. Sorting by price-per-sleeper alone then over-
+                corrected: two children got two singles, because a single's
+                per-sleeper price is lower than a bunk's even though one bunk
+                satisfies the whole brief for less money. So the tie-break asks
+                the question that actually decides it - does this unit cover
+                the demand still outstanding?
+                """
+                per_sleeper = p.price_inr / max(1, p.sleeps)
+                covers_need = 0 if p.sleeps >= remaining else 1
+                return (covers_need, per_sleeper, p.price_inr, p.name)
+
+            cheapest = min(options, key=value)
             units_covered = max(1, cheapest.sleeps)
             if budget is not None and spent + cheapest.price_inr > budget:
                 # Cannot afford the best-cover option; fall back to the plain
@@ -143,7 +155,7 @@ def optimize_to_budget(
     # otherwise the client would be trading a missing bed for a nicer one.
     if not unserved:
         upgraded = _upgrade_within_budget(
-            selections, required, budget, spent, tier_ceiling
+            selections, required, budget, spent, tier_ceiling, audience
         )
         selections = upgraded["selections"]
         spent = upgraded["spent"]
@@ -153,7 +165,7 @@ def optimize_to_budget(
         for category in _by_priority(optional):
             for _ in range(optional[category]):
                 options = [
-                    p for p in products_satisfying(category)
+                    p for p in products_satisfying(category, audience=audience)
                     if _tier_rank(p.tier) <= tier_ceiling
                 ]
                 if not options:
@@ -171,20 +183,32 @@ def optimize_to_budget(
         # honest number for "how much more do you need".
         shortfall = _cheapest_cost_of_shortfall(unserved, tier_ceiling)
 
+    # The total is summed from the finished lines rather than read from the
+    # running `spent` counter. The two disagreed: an upgrade adjusted a line
+    # without the counter tracking it the same way, and the design then
+    # published a total that did not match its own shopping list - the exact
+    # defect this module exists to prevent. Deriving it makes the invariant
+    # impossible to break as the code changes.
+    total = sum(int(s["line_total_inr"]) for s in selections)
+
     result = OptimisationResult({
-                "selections": selections,
-                "total_inr": spent,
-                "budget_inr": budget,
-                "feasible": feasible,
-                "shortfall_inr": shortfall,
-                # The raw (category, missing) pairs, so a caller can tell exactly
-                # which categories the budget blocked rather than re-parsing prose.
-                "unserved": [{"category": c, "missing": n} for c, n in unserved],
-        "infeasible": None if feasible else _infeasible_message(unserved, spent, budget, shortfall),
-        "options": [] if feasible else _escape_routes(unserved, spent, budget, shortfall, style_tier),
+        "selections": selections,
+        "total_inr": total,
+        "budget_inr": budget,
+        "feasible": feasible,
+        "shortfall_inr": shortfall,
+        # The raw (category, missing) pairs, so a caller can tell exactly
+        # which categories the budget blocked rather than re-parsing prose.
+        "unserved": [{"category": c, "missing": n} for c, n in unserved],
+        "infeasible": None if feasible else _infeasible_message(
+            unserved, total, budget, shortfall
+        ),
+        "options": [] if feasible else _escape_routes(
+            unserved, total, budget, shortfall, style_tier
+        ),
         "catalog_version": catalog.version(),
     })
-    metrics.observe("optimizer.total_inr", float(spent))
+    metrics.observe("optimizer.total_inr", float(total))
     if not feasible:
         metrics.increment("optimizer.infeasible")
     return result
@@ -237,6 +261,7 @@ def _upgrade_within_budget(
     budget: Optional[int],
     spent: int,
     tier_ceiling: int,
+    audience: str = "any",
 ) -> Dict[str, Any]:
     """
     Swap each selected item for a better one, cheapest upgrade first.
@@ -259,7 +284,7 @@ def _upgrade_within_budget(
     candidates: List[tuple[int, int, Dict[str, Any]]] = []
     for index, sel in enumerate(selections):
         category = sel["category"]
-        for product in products_satisfying(category):
+        for product in products_satisfying(category, audience=audience):
             if _tier_rank(product.tier) > tier_ceiling:
                 continue
             delta = product.price_inr - sel["unit_price_inr"]

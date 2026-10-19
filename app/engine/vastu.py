@@ -242,6 +242,11 @@ def _grade(score: int) -> str:
 # --------------------------------------------------------------------------
 
 
+def _known_walls(items: List[Dict[str, Any]]) -> List[str]:
+    """Walls actually recorded on placed items, never None."""
+    return sorted({str(i.get("wall")) for i in items if i.get("wall")})
+
+
 def evaluate_vastu(
     layout_items: List[Dict[str, Any]],
     room_type: str = "",
@@ -283,10 +288,10 @@ def evaluate_vastu(
         return items[0].get("wall") if items else None
 
     # --- bed placement -------------------------------------------------
-    beds = by_category.get("bed", [])
+    beds = [b for b in by_category.get("bed", []) if b.get("wall")]
     rule = RULES["bed_head_south"]
     if beds:
-        walls = [b.get("wall") for b in beds]
+        walls = [str(b.get("wall")) for b in beds]
         if all(w in _SATISFYING["bed_head_south"] for w in walls):
             results.append(VastuResult(
                 rule=rule, passed=True,
@@ -307,10 +312,10 @@ def evaluate_vastu(
             ))
 
     # --- study desk ----------------------------------------------------
-    desks = by_category.get("desk", [])
+    desks = [d for d in by_category.get("desk", []) if d.get("wall")]
     rule = RULES["desk_east_or_north"]
     if desks:
-        walls = [d.get("wall") for d in desks]
+        walls = [str(d.get("wall")) for d in desks]
         if all(w in _SATISFYING["desk_east_or_north"] for w in walls):
             near = ""
             if window_direction in ("east", "northeast", "north", "southeast"):
@@ -351,7 +356,10 @@ def evaluate_vastu(
     # --- mirror opposite a bed ----------------------------------------
     rule = RULES["mirror_not_opposite_bed"]
     mirrors = by_category.get("decor", [])
-    mirrors = [m for m in mirrors if "mirror" in str(m.get("name", "")).lower()]
+    mirrors = [
+        m for m in mirrors
+        if "mirror" in str(m.get("name", "")).lower() and m.get("wall")
+    ]
     if mirrors and beds:
         # Opposite means the two sit on the facing walls.
         opposing = {"north": "south", "south": "north", "east": "west", "west": "east"}
@@ -395,18 +403,47 @@ def evaluate_vastu(
     # --- kitchen-specific ---------------------------------------------
     if room_type == "kitchen":
         rule = RULES["cook_south_east"]
-        # Without a per-item "role" field, judge the room's own orientation.
-        if window_direction in _SATISFYING["cook_south_east"] or door_direction in _SATISFYING["cook_south_east"]:
+        # Judge the cooking platform's own wall. The old version judged the
+        # room's door/window bearings instead, so a kitchen with a north-east
+        # window "passed" while the layout put the hob on the south wall - the
+        # exact contradiction the client saw ("respects Vastu" above a failed
+        # south-east rule).
+        cooking = [
+            i for i in (layout_items or [])
+            if isinstance(i, dict) and (
+                i.get("role") == "cooking"
+                or i.get("is_cooking") is True
+                or "hob" in str(i.get("name", "")).lower()
+                or "stove" in str(i.get("name", "")).lower()
+            )
+        ]
+        wall = cooking[0].get("wall") if cooking else None
+        facing = cooking[0].get("facing") if cooking else None
+        if wall is not None:
+            ok = wall == "southeast"
             results.append(VastuResult(
-                rule=rule, passed=True,
-                explanation="The kitchen orientation supports a south-east cooking position.",
+                rule=rule, passed=ok,
+                explanation=(
+                    "The cooking platform is on the south-east wall"
+                    + (f", facing {facing}." if facing else ".")
+                    if ok else
+                    f"The cooking platform is on the {wall} wall; Vastu asks for "
+                    f"the south-east."
+                ),
+                remedy="" if ok else _REMEDY["cook_south_east"],
+                item_name=cooking[0].get("name", "cooking platform"),
                 item_category="kitchen",
             ))
         else:
+            # No placed platform: the rule is unassessable from geometry. The
+            # DesignPipeline attaches the declared cooking position and
+            # `analyse_design` replaces this result from it.
             results.append(VastuResult(
                 rule=rule, passed=False,
-                explanation="The kitchen does not currently support a south-east cooking "
-                            "position; the platform would face another direction.",
+                explanation=(
+                    "No cooking platform is placed in the plan, so compliance "
+                    "with the south-east rule cannot be shown."
+                ),
                 remedy=_REMEDY["cook_south_east"],
                 item_category="kitchen",
             ))
@@ -466,7 +503,14 @@ def evaluate_vastu(
     else:
         score = 100
 
-    notes: List[str] = []
+    # Notes are generated from the rule results, never written by the model.
+    # The old pipeline mixed the model's prose into this section, so
+    # "Limited decorative flexibility" appeared under "Vastu Notes" and a
+    # "respects Vastu" sentence sat next to a failed rule.
+    notes: List[str] = [
+        ("" if r.passed else "Needs attention: ") + r.explanation
+        for r in results
+    ]
     if missing:
         notes.append(
             "Add the door and window directions for a complete assessment; "
@@ -485,4 +529,122 @@ def evaluate_vastu(
     metrics.gauge("vastu.score", float(score))
     metrics.increment("vastu.evaluated")
     logger.info("vastu_evaluated score=%d passed=%d/%d", score, report.passed_count, len(results))
+    return report
+
+
+def analyse_design(
+    design: Dict[str, Any],
+    brief: Any,
+) -> VastuReport:
+    """Assess a design dict against the client's own form inputs.
+
+    Everything the rules need - room type, door, window, compliance level and
+    the positions the layout engine produced - is read from the structured
+    brief and the design itself. Agents do not pass these in prose.
+
+    Items have no explicit wall when the layout has not been computed, so the
+    room's own openings are used for the kitchen rule. Under Strict a kitchen
+    must still name a south-east cooking position; that is the condition the
+    validator blocks on.
+    """
+    room_type = str(getattr(brief, "room_type", "") or "").lower()
+    compliance = str(getattr(brief, "vastu_compliance", "soft") or "soft").lower()
+
+    items: List[Dict[str, Any]] = []
+    layout = design.get("layout") or {}
+    for placed in layout.get("items") or []:
+        if isinstance(placed, dict):
+            items.append({
+                "name": placed.get("name", ""),
+                "category": placed.get("category", ""),
+                "wall": placed.get("wall"),
+                "height": placed.get("height", 0),
+            })
+    if not items:
+        # No plan yet. Placement rules cannot be judged without geometry, so
+        # the room's own openings are the only real signal; inventing a wall
+        # for each item would produce a verdict about a layout that does not
+        # exist. Non-directional observations (entrance clear, daylight) still
+        # run from the door and window bearings.
+        items = []
+
+    report = evaluate_vastu(
+        items,
+        room_type=room_type,
+        door_direction=getattr(brief, "door_direction", None),
+        window_direction=getattr(brief, "window_direction", None),
+        compliance=compliance,
+    )
+
+    # A kitchen under Strict is *required* to show a south-east cooking
+    # position. When the plan carries no wall for the counter, the rule could
+    # not be checked at all - record that as an unpassed rule with an explicit
+    # reason, rather than silently omitting it and reporting a high score.
+    if room_type == "kitchen":
+        status = design.get("cooking_platform") or {}
+        wall = status.get("wall")
+        facing = status.get("facing")
+        existing = next(
+            (r for r in report.results if r.rule.code == "cook_south_east"), None
+        )
+        if status:
+            ok = wall == "southeast"
+            if compliance == "strict":
+                ok = ok and facing == "east"
+            if existing is not None:
+                existing.passed = ok
+                existing.explanation = (
+                    f"The cooking platform is placed on the south-east wall"
+                    + (f", facing {facing}." if facing else ".")
+                    if ok else
+                    f"The cooking platform is placed on the {wall or 'unspecified'} "
+                    f"wall"
+                    + (f" facing {facing}" if facing else "")
+                    + "; Vastu asks for the south-east."
+                )
+                existing.remedy = "" if ok else _REMEDY["cook_south_east"]
+                existing.item_name = status.get("name", "cooking platform")
+            else:
+                report.results.append(VastuResult(
+                    rule=RULES["cook_south_east"],
+                    passed=ok,
+                    explanation=(
+                        f"The cooking platform is placed on the {wall} wall"
+                        + (f", facing {facing}." if facing else ".")
+                    ),
+                    remedy="" if ok else _REMEDY["cook_south_east"],
+                    item_name=status.get("name", "cooking platform"),
+                    item_category="kitchen",
+                ))
+
+    # Kitchen placement can replace the initially unassessable cooking rule;
+    # recompute the score from that final result rather than leaving the
+    # pre-placement score beside a passing rule.
+    if report.results:
+        earned = 0.0
+        possible = 0.0
+        for result in report.results:
+            weight = 1.0 if result.rule.severity == "error" else 0.5
+            possible += weight
+            if result.passed:
+                earned += weight
+        report.score = int(round((earned / possible) * 100)) if possible else 100
+    else:
+        report.score = 100
+    report.grade = _grade(report.score)
+
+    # Notes must reflect the final rule set.
+    report.notes = [
+        ("" if r.passed else "Needs attention: ") + r.explanation
+        for r in report.results
+    ]
+    if report.missing_inputs:
+        report.notes.append(
+            "Add the door and window directions for a complete assessment; "
+            "without them several rules are skipped."
+        )
+    if compliance == "soft":
+        report.notes.append("Vastu was requested as a soft preference, so this is advisory.")
+    report.notes = report.notes[:6]
+    metrics.gauge("vastu.score", float(report.score))
     return report

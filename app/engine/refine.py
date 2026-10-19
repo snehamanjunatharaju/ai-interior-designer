@@ -286,9 +286,15 @@ def apply_refinement(
             # client is swapping *to*, which is also mentioned in the sentence.
             sources = [intent.slots["from"]] if intent.slots.get("action") == "swap" \
                 and intent.slots.get("from") else intent.item_names
+            found_any = False
             for word in sources:
                 canonical = _canon(word)
                 before_len = len(furniture)
+                if any(
+                    isinstance(f, dict) and _canon(str(f.get("name", ""))) == canonical
+                    for f in furniture
+                ):
+                    found_any = True
                 # Compare on the canonical term in both directions: the
                 # client's word ("armchair") and the catalog name
                 # ("Armchair - Single") canonicalise identically, so an
@@ -301,7 +307,12 @@ def apply_refinement(
                 if len(furniture) != before_len:
                     changed.append(f"removed {canonical}")
 
-            if intent.slots.get("action") == "swap":
+            if not found_any:
+                # "Remove the desk" in a room with no desk is a no-op with an
+                # explanation, not a silent success.
+                _refuse(design, sources[0] if sources else "item", catalog_lookup)
+
+            if intent.slots.get("action") == "swap" and found_any:
                 # The replacement is an item word that is not the source. Note
                 # that "bean bag" canonicalises to "beanbag" while "armchair"
                 # canonicalises to "armchair", so the source is excluded by
@@ -327,7 +338,8 @@ def apply_refinement(
 
     elif intent.target == TARGET_ITEM and intent.slots.get("action") == "add":
         from app.engine.brief import canonical_item_for as _canon
-        options = catalog_lookup(_canon(intent.item_names[-1]), limit=1)
+        wanted = intent.item_names[-1]
+        options = catalog_lookup(_canon(wanted), limit=1)
         if options:
             product = options[0]
             furniture = design.setdefault("furniture", [])
@@ -340,6 +352,8 @@ def apply_refinement(
                     "brand_suggestions": [product.brand],
                 })
                 changed.append(f"added {product.name}")
+        else:
+            _refuse(design, wanted, catalog_lookup)
 
     elif intent.target == TARGET_ITEM and intent.slots.get("action") == "resize":
         # Resizing is a catalog concern: pick a larger or smaller variant of
@@ -406,17 +420,25 @@ def apply_refinement(
                     target["brand_suggestions"] = [product.brand]
                     changed.append(f"resized to {product.name}")
             if not changed:
-                # Nothing in the catalog is larger (or smaller) than what is
-                # already there. Say so rather than reporting a resize that
-                # changed nothing, which reads as a broken button.
-                note = (
-                    f"{current_word} is already the largest {current_word} in "
-                    f"the catalog."
-                    if bigger else
-                    f"{current_word} is already the smallest {current_word} in "
-                    f"the catalog."
-                )
-                design.setdefault("_refinement", {})["note"] = note
+                if target is None:
+                    # "Make the desk bigger" in a kitchen used to produce
+                    # "Add chair only": the desk did not exist, so the
+                    # resizer fell through to the catalog and changed an
+                    # unrelated item. If the named thing is not in the design,
+                    # say so and change nothing.
+                    _refuse(design, current_word, catalog_lookup)
+                else:
+                    # Nothing in the catalog is larger (or smaller) than what
+                    # is already there. Say so rather than reporting a resize
+                    # that changed nothing, which reads as a broken button.
+                    note = (
+                        f"{current_word} is already the largest {current_word} in "
+                        f"the catalog."
+                        if bigger else
+                        f"{current_word} is already the smallest {current_word} in "
+                        f"the catalog."
+                    )
+                    design.setdefault("_refinement", {})["note"] = note
 
     elif intent.target == TARGET_LIGHTING:
         design["lighting_plan"] = (
@@ -434,6 +456,27 @@ def apply_refinement(
 
     design.setdefault("_refinement", {})["changed"] = changed
     return design
+
+
+def _refuse(design: Dict[str, Any], word: str, catalog_lookup) -> None:
+    """Record that the named item is not in this design, and change nothing.
+
+    `changed` is left empty deliberately: the caller's diff then shows that
+    nothing moved, and the note explains why. The message names the item in
+    the client's own words.
+    """
+    from app.engine.brief import canonical_item_for as _canon
+
+    name = word.strip().lower()
+    available = []
+    for entry in design.get("furniture") or []:
+        if isinstance(entry, dict) and entry.get("name"):
+            available.append(str(entry["name"]))
+    design.setdefault("_refinement", {})["refused"] = True
+    design["_refinement"]["message"] = f"There is no {name} in this design"
+    design["_refinement"]["available"] = available
+    metrics.increment("refinement.refused_missing_item")
+    logger.info("refinement_refused item=%s canonical=%s", name, _canon(name))
 
 
 def describe_change(intent: RefinementIntent) -> str:

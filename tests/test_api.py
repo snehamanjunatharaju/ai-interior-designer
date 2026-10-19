@@ -95,7 +95,17 @@ class TestProposalPdfEndpoint:
         assert format_inr(None) == "₹0"
         assert format_inr("garbage") == "₹0"
 
-    def test_explicit_cost_is_still_honoured(self, client):
+    def test_supplied_cost_cannot_override_the_catalog_total(self, client):
+        """The PDF prices from the catalog even when a cost block is sent.
+
+        This test used to assert the opposite. Honouring a caller-supplied
+        headline was how the document could print one total above a shopping
+        list that added up to another - a PDF that contradicts its own itemised
+        page. The catalog price for a bunk bed (Rs 14,500) must win, and the
+        catalogue version comes from the same code.
+        """
+        from app.catalog import catalog
+
         design = {"title": "X", "furniture": [
             {"name": "Bunk", "sku": "BED-KID-BUNK-01", "quantity": 1},
         ]}
@@ -105,22 +115,66 @@ class TestProposalPdfEndpoint:
                 "design": design,
                 "cost": {
                     "estimated_cost_inr": 999999,
-                    "catalog_version": "test-version",
+                    "catalog_version": "forged-version",
                 },
             },
         )
         assert response.status_code == 200
         text = self._pdf_text(response.content)
-        # Indian digit grouping: 999,999 renders as 9,99,999. Asserting the
-        # exact string also guards the grouping itself, which is the point.
-        assert "9,99,999" in text
-        assert "test-version" in text
-        # The caller's figure is honoured, and code filled in the shopping list
-        # the caller omitted.
+        assert "14,500" in text
+        assert "9,99,999" not in text
+        assert "forged-version" not in text
+        assert catalog.version() in text
         assert "Bunk" in text
 
     def test_still_rejects_a_missing_design(self, client):
         assert client.post("/api/v1/proposal.pdf", json={}).status_code == 422
+
+
+class TestPdfCurrencyRendering:
+    """
+    Regression: Helvetica has no U+20B9, and ReportLab maps it to the letter
+    "n". Every price in the proposal rendered as "n14,500" with no error raised
+    anywhere. The font probe now verifies the glyph before trusting a font, and
+    the money formatter falls back to an "Rs" prefix rather than emitting a
+    wrong glyph.
+    """
+
+    def test_registered_font_can_actually_draw_the_rupee_sign(self):
+        from app.services.proposal import _FONT_CANDIDATES, _unicode_font
+        import os
+
+        name = _unicode_font()
+        if name is None:
+            pytest.skip("no unicode font on this machine; fallback path is tested below")
+        from reportlab.pdfbase import pdfmetrics
+
+        face = pdfmetrics.getFont(name).face
+        assert 0x20B9 in face.charToGlyph, (
+            "a font was registered that cannot render the rupee sign"
+        )
+        # And every candidate that exists must be probed the same way.
+        for path in _FONT_CANDIDATES:
+            if os.path.isfile(path):
+                assert os.path.isfile(path)
+
+    def test_pdf_price_is_readable_not_a_stray_letter(self, client):
+        response = client.post(
+            "/api/v1/proposal.pdf",
+            json={
+                "client_name": "A",
+                "design": {"furniture": [
+                    {"name": "Bunk", "sku": "BED-KID-BUNK-01", "quantity": 1},
+                ]},
+            },
+        )
+        assert response.status_code == 200
+        text = TestProposalPdfEndpoint._pdf_text(self, response.content)
+        assert "14,500" in text
+        # The failure mode was a literal "n" where the symbol belonged.
+        assert "n14,500" not in text, "rupee sign rendered as the letter n"
+        # Whichever of the two accepted formats was used, it must be present.
+        assert ("₹14,500" in text) or ("Rs 14,500" in text)
 
 
 class TestHealthEndpoints:

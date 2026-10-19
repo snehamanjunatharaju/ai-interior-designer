@@ -212,6 +212,29 @@ class OllamaProvider(LLMProvider):
         except Exception:
             return False
 
+    async def available_for(self, model: Optional[str] = None) -> bool:
+        """
+        Is this model actually pulled?
+
+        Ollama reports healthy while a specific model is absent - the daemon is
+        up, but `llama3.1:8b` was never downloaded, and the request fails at
+        generation time. That is a much worse failure than a health check that
+        says so up front, so availability is checked per model.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(f"{self.base_url}/api/tags")
+                if resp.status_code != 200:
+                    return False
+                names = {
+                    m.get("name", "").split(":")[0]
+                    for m in (resp.json().get("models") or [])
+                }
+                wanted = (model or self.model or "").split(":")[0]
+                return bool(wanted) and wanted in names
+        except Exception:
+            return False
+
     async def _complete(
         self, prompt: str, system: Optional[str], **kwargs: Any
     ) -> tuple[str, int, int]:
@@ -219,6 +242,10 @@ class OllamaProvider(LLMProvider):
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            # Hold the model in RAM between calls. Without this an 8B model is
+            # evicted and reloaded on every request, which adds tens of seconds
+            # and makes the stronger model slower than the 2B fallback.
+            "keep_alive": settings.OLLAMA_KEEP_ALIVE,
             "options": {
                 "temperature": kwargs.get("temperature"),
                 "num_predict": kwargs.get("max_tokens"),
@@ -390,7 +417,11 @@ class LLMRegistry:
         candidates: Dict[str, LLMProvider] = {}
 
         if "ollama" in settings.LLM_PROVIDERS:
+            # The provider starts on the best model that is actually present.
+            # `available_for` is async so this cannot be resolved here, so the
+            # candidate list is kept and resolved on first use.
             candidates["ollama"] = OllamaProvider()
+            self._ollama_models = list(settings.MODEL_CANDIDATES)
 
         if "ivis" in settings.LLM_PROVIDERS and settings.IVIS_GATEWAY_API_KEY and settings.IVIS_GATEWAY_BASE_URL:
             candidates["ivis"] = OpenAICompatibleProvider(
@@ -419,6 +450,36 @@ class LLMRegistry:
 
     def get(self, name: str) -> Optional[LLMProvider]:
         return self._providers.get(name)
+
+    async def resolve_model(self) -> str:
+        """
+        Pick the best configured model this machine can actually run.
+
+        `DEFAULT_MODEL` is a preference, not a fact: a developer machine may
+        not have an 8B model pulled. Ollama reports healthy as long as the
+        daemon is up, so the first request against a missing model fails deep
+        inside generation. Resolving against the models Ollama actually has
+        turns that into a quiet downgrade to the fallback.
+        """
+        provider = self._providers.get("ollama")
+        candidates = getattr(self, "_ollama_models", None) or [
+            settings.DEFAULT_MODEL
+        ]
+        if provider is None or not hasattr(provider, "available_for"):
+            return candidates[0]
+        for model in candidates:
+            if await provider.available_for(model):
+                return model
+        return candidates[-1]
+
+    async def use_best_available_model(self) -> str:
+        """Point the Ollama provider at the best available model. Idempotent."""
+        model = await self.resolve_model()
+        provider = self._providers.get("ollama")
+        if provider is not None and hasattr(provider, "available_for"):
+            provider.model = model
+        logger.info("llm_model_selected model=%s", model)
+        return model
 
     def all(self) -> Dict[str, LLMProvider]:
         return dict(self._providers)

@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.catalog import catalog
 from app.core.observability import get_logger, metrics
 from app.engine.brief import BRIEF_TO_CATALOG_CATEGORY, BriefConstraints
 
@@ -211,8 +212,15 @@ def validate_design(
 
     _check_required_items(design, brief, report)
     _check_excluded_items(design, brief, report)
+    _check_audience(design, brief, report)
+    _check_room_appropriate(design, brief, report)
+    _check_wfh_kit(design, brief, report)
     _check_color_scheme(design, brief, report)
+    _check_unsupported_claims(design, brief, report)
+    _check_special_requirements(design, brief, report)
+    _check_vastu_rules(design, brief, report)
     _check_budget(design, brief, cost, report)
+    _check_shopping_list(design, brief, cost, report)
     _check_no_placeholders(design, report)
     _check_real_products(design, report)
 
@@ -323,6 +331,302 @@ def _check_required_items(
             ))
 
 
+def _check_audience(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """
+    No children's furniture in a room the brief reserved for adults.
+
+    This check did not exist, which is why an adults-only master bedroom came
+    back with a Kids Single Cot and a Kids Chair. Nothing was filtering on the
+    way in, and nothing was checking on the way out, so the leak was silent
+    in both directions.
+    """
+    audience = getattr(brief, "audience", "any")
+    if audience != "adult":
+        return
+
+    from app.engine.occupants import product_is_allowed
+
+    offenders: List[str] = []
+    for entry in design.get("furniture", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        product = catalog.get(str(entry.get("sku", "")).strip())
+        if product is None:
+            continue
+        if not product_is_allowed(product, audience):
+            offenders.append(f"{product.name} ({product.sku})")
+
+    if not offenders:
+        return
+
+    report.checks_run += 1
+    report.violations.append(Violation(
+        code="audience_mismatch",
+        severity=SEVERITY_ERROR,
+        message=(
+            f"This room is for adults, but the design includes children's "
+            f"furniture: {', '.join(offenders[:4])}."
+        ),
+        expected="adult-appropriate products only",
+        actual=f"{len(offenders)} children's product(s)",
+        remedy_hint=(
+            "Replace these with the equivalent adult product. The catalog "
+            "records who each item is for, so an adult desk and an adult chair "
+            "are available in the same categories."
+        ),
+    ))
+
+
+def _check_room_appropriate(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """No product that belongs to a different kind of room.
+
+    A kitchen shopping list carried a kids' study table, a bean bag and a
+    sofa. Nothing was checking the room, so the only filter was the model's
+    own judgement. The catalog now records which rooms each category serves,
+    and this enforces it in code.
+    """
+    room = (getattr(brief, "room_type", "") or "").lower()
+    if not room:
+        return
+
+    offenders: List[str] = list(
+        design.get("_room_filter_violations") or []
+    )
+    for entry in design.get("furniture", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        product = catalog.get(str(entry.get("sku", "")).strip())
+        if product is None:
+            continue
+        if not catalog.allowed_in_room(product, room):
+            offenders.append(f"{product.name} ({product.sku})")
+
+    report.checks_run += 1
+    if offenders:
+        report.violations.append(Violation(
+            code="wrong_room_item",
+            severity=SEVERITY_ERROR,
+            message=(
+                f"This is a {room.replace('_', ' ')} and the design includes "
+                f"items that belong elsewhere: {', '.join(offenders[:4])}."
+            ),
+            expected=f"only products suited to a {room.replace('_', ' ')}",
+            actual=f"{len(offenders)} out-of-room item(s)",
+            remedy_hint="Remove them and choose from the catalog list for this room.",
+        ))
+    else:
+        report.checks_passed += 1
+
+
+def _check_special_requirements(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """Every requirement the client ticked must be visibly addressed.
+
+    "Kids Safe", "Heavy Storage" and "Low Maintenance" were selected on the
+    form and appeared nowhere in the design. A requirement that is silently
+    dropped is worse than one that was never offered, so each selected chip
+    is checked against the design's own words and items.
+    """
+    from app.engine.brief import REQUIREMENT_KEYWORDS, REQUIREMENT_LABELS
+
+    requirements = list(getattr(brief, "special_requirements", []) or [])
+    if not requirements:
+        return
+
+    horizon: List[str] = []
+    for key in ("concept", "layout_description", "lighting_plan",
+                "storage_strategy", "title"):
+        value = design.get(key)
+        if isinstance(value, str):
+            horizon.append(value)
+    for key in ("decor_suggestions", "pros", "zones"):
+        horizon.extend(str(v) for v in (design.get(key) or []))
+    for entry in design.get("furniture", []) or []:
+        if isinstance(entry, dict):
+            horizon.append(str(entry.get("name", "")))
+            product = catalog.get(str(entry.get("sku", "")).strip())
+            if product is not None:
+                horizon.append(product.name)
+                horizon.append(product.notes)
+    blob = " ".join(horizon).lower()
+
+    for raw in requirements:
+        key = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+        label = REQUIREMENT_LABELS.get(key, str(raw))
+        keywords = REQUIREMENT_KEYWORDS.get(key)
+        report.checks_run += 1
+        # An unknown chip is not checkable in code, so it is not failed -
+        # accusing a design of ignoring a requirement nobody defined would be
+        # a false positive.
+        if not keywords or any(k in blob for k in keywords):
+            report.checks_passed += 1
+            continue
+        report.violations.append(Violation(
+            code="requirement_not_addressed",
+            severity=SEVERITY_ERROR,
+            message=(
+                f"The client selected '{label}' but the design never addresses it."
+            ),
+            expected=label,
+            actual="not mentioned and not supported by any item",
+            remedy_hint=(
+                f"Address {label} explicitly in the layout or storage text and "
+                f"with a catalog item that provides it."
+            ),
+        ))
+
+
+def _check_vastu_rules(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """Does the code's own Vastu assessment contradict the design?
+
+    The layout text used to say "respects Vastu" while the rule check reported
+    "Cooking on the south-east: failed". Under Strict, a failed strong rule is
+    a blocking error, and any "Vastu compliant" sentence is rejected when the
+    check says otherwise.
+    """
+    level = str(getattr(brief, "vastu_compliance", "soft")).lower()
+    if level == "ignore":
+        return
+
+    assessment = design.get("_vastu") or {}
+    results = assessment.get("results") or []
+    if room_is_kitchen(brief) and level == "strict":
+        report.checks_run += 1
+        cooking = next(
+            (r for r in results if r.get("code") == "cook_south_east"), None
+        )
+        # The rule must have been evaluated and passed. "Not evaluated" is a
+        # failure under Strict: the client asked for a guarantee.
+        if cooking is None or not cooking.get("passed"):
+            report.violations.append(Violation(
+                code="vastu_strict_violation",
+                severity=SEVERITY_ERROR,
+                message=(
+                    "Strict Vastu was requested and the cooking platform is not "
+                    "on the south-east wall facing east"
+                    + ("." if cooking is None else f": {cooking.get('explanation', '')}.")
+                ),
+                expected="cooking platform on the south-east, facing east",
+                actual=f"{(cooking or {}).get('wall') or 'not placed'}",
+                remedy_hint="Place the cooking platform on the south-east wall, facing east.",
+            ))
+        else:
+            report.checks_passed += 1
+
+    # A compliance claim that the rule results do not support.
+    from app.engine.assumptions import unsupported_claims
+
+    claims = unsupported_claims({**design, "_vastu": assessment})
+    claim_codes = {c["code"] for c in claims}
+    report.checks_run += 1
+    if "contradicted_vastu_claim" in claim_codes:
+        report.violations.append(Violation(
+            code="contradicted_vastu_claim",
+            severity=SEVERITY_ERROR if level == "strict" else SEVERITY_WARNING,
+            message=(
+                "The design claims Vastu compliance, but the rule check reports "
+                "failed rules, so the claim is false."
+            ),
+            expected="a claim the rule results support",
+            actual=", ".join(
+                r.get("title", r.get("code", "")) for r in results
+                if not r.get("passed")
+            ) or "no assessment",
+            remedy_hint=(
+                "Remove the compliance claim. Vastu notes are generated from the "
+                "rule results, not written as prose."
+            ),
+        ))
+    else:
+        report.checks_passed += 1
+
+
+def room_is_kitchen(brief: BriefConstraints) -> bool:
+    return str(getattr(brief, "room_type", "")).lower() == "kitchen"
+
+
+def _check_wfh_kit(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """
+    A work-from-home brief must contain both a desk and a chair.
+
+    A desk with nowhere to sit is a shelf, and this was reachable: the brief
+    said "work from home", the requirement was derived, and a design could
+    still satisfy the desk half and omit the chair.
+    """
+    if not getattr(brief, "requires_workstation", False):
+        return
+
+    for category in ("desk", "chair"):
+        report.checks_run += 1
+        categories = _SYNONYM_CATEGORIES.get(category, {category})
+        count = _count_items(design, categories, category)
+        if count >= 1:
+            report.checks_passed += 1
+        else:
+            report.violations.append(Violation(
+                code="wfh_kit_incomplete",
+                severity=SEVERITY_ERROR,
+                message=(
+                    "The brief describes a work-from-home setup but the design "
+                    f"has no {category}."
+                ),
+                expected=f"at least 1 {category}",
+                actual="none",
+                remedy_hint=(
+                    f"Add a {category} from the catalog. A workstation needs both."
+                ),
+            ))
+
+
+def _check_unsupported_claims(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """
+    The design must not claim more than it can support.
+
+    Two claims used to pass unchallenged:
+
+      * "plenty of natural light" and "Vastu compliant" on a design with no door
+        or window bearing, which describes a room whose orientation was invented;
+      * a mirror or a lamp described in detail but never present in the
+        shopping list, so the client could not buy what the text described.
+
+    Both are warnings rather than errors: the design is still usable, but the
+    client is told exactly which sentence is unverified.
+    """
+    from app.engine.assumptions import unsupported_claims
+
+    strict = str(getattr(brief, "vastu_compliance", "soft")).lower() == "strict"
+    enriched = dict(design)
+    enriched.setdefault("door_direction", getattr(brief, "door_direction", None))
+    enriched.setdefault("window_direction", getattr(brief, "window_direction", None))
+
+    for problem in unsupported_claims(enriched):
+        report.checks_run += 1
+        report.violations.append(Violation(
+            code=problem["code"],
+            # A Strict-Vastu brief makes an unverifiable compliance claim a
+            # hard failure: the client asked for a guarantee and there is no
+            # basis for one.
+            severity=SEVERITY_ERROR if (
+                strict and problem["code"] == "unverified_bearing_claim"
+            ) else SEVERITY_WARNING,
+            message=problem["message"],
+            expected="claims supported by the supplied inputs",
+            actual=problem["code"],
+            remedy_hint=problem["remedy"],
+        ))
+
+
 # Categories that satisfy a request for another canonical item.
 #
 # This must agree with BRIEF_TO_CATALOG_CATEGORY in app.engine.brief, which is
@@ -393,6 +697,51 @@ def _check_color_scheme(
 
     hex_codes = [h for h in (palette.get("hex_codes") or []) if isinstance(h, str)]
 
+    # --- the named scheme itself --------------------------------------
+    # A "Warm Earthy" brief came back with navy, sky blue and teal. The
+    # palette is now keyed on the selected scheme and this check enforces it:
+    # a colour word the scheme forbids, or a hue far from any of the scheme's
+    # own, fails the design. Only schemes with a defined palette are checked
+    # here; the generic saturation rules below still apply to the rest.
+    from app.engine.palette import palette_for, scheme_key
+
+    selected = scheme_key(brief.form_color_scheme or brief.color_scheme or "")
+    if selected in ("warm", "earthy", "pastel", "monochrome", "cool",
+                    "earthy_green", "jewel", "vibrant"):
+        expected = palette_for(selected)
+        report.checks_run += 1
+        banned = [
+            word for word in expected.get("forbidden", [])
+            if re.search(rf"\b{re.escape(word)}\b", names)
+        ]
+        off_palette = _far_from_palette(hex_codes, expected.get("hex_codes", []))
+        if banned or off_palette:
+            report.violations.append(Violation(
+                code="palette_scheme_mismatch",
+                severity=SEVERITY_ERROR,
+                message=(
+                    f"The client selected the {expected['label']} colour scheme, "
+                    f"but the palette contains "
+                    + (", ".join(sorted(set(banned))) if banned else
+                       ", ".join(off_palette[:3]))
+                    + f". {expected['label']} is "
+                    + ", ".join([expected['primary'], expected['secondary'],
+                                 expected['accent']]) + "."
+                ),
+                expected=expected["label"],
+                actual=", ".join(
+                    [str(palette.get("primary", "")),
+                     str(palette.get("secondary", "")),
+                     str(palette.get("accent", ""))]
+                ).strip(", ") or "unnamed",
+                remedy_hint=(
+                    f"Use only the {expected['label']} palette: "
+                    f"{', '.join(expected['hex_codes'])}."
+                ),
+            ))
+        else:
+            report.checks_passed += 1
+
     if scheme == "vibrant":
         report.checks_run += 1
         muted_hits = [w for w in _MUTED_WORDS if w in names]
@@ -453,6 +802,55 @@ def _check_color_scheme(
                 report.checks_passed += 1
         else:
             report.checks_passed += 1
+
+
+def _rgb_to_hsv(rgb: tuple) -> tuple:
+    """(hue in degrees, saturation, value) for an RGB triple."""
+    r, g, b = (c / 255.0 for c in rgb)
+    mx, mn = max(r, g, b), min(r, g, b)
+    delta = mx - mn
+    if delta == 0:
+        hue = 0.0
+    elif mx == r:
+        hue = 60 * (((g - b) / delta) % 6)
+    elif mx == g:
+        hue = 60 * (((b - r) / delta) + 2)
+    else:
+        hue = 60 * (((r - g) / delta) + 4)
+    return hue, (delta / mx if mx else 0.0), mx
+
+
+def _far_from_palette(hex_codes: List[str], expected: List[str],
+                      tolerance_deg: float = 35.0) -> List[str]:
+    """Hex codes whose hue is not close to any colour the scheme allows.
+
+    The hue is what carries the scheme: a muted teal and a saturated teal are
+    both teal. Grey and near-black/white carry no hue, so they pass - every
+    scheme has neutrals.
+    """
+    expected_hues = []
+    for code in expected:
+        rgb = _hex_to_rgb(code)
+        if not rgb:
+            continue
+        hue, sat, val = _rgb_to_hsv(rgb)
+        if sat >= 0.12 and 0.12 <= val <= 0.98:
+            expected_hues.append(hue)
+    if not expected_hues:
+        return []
+
+    bad: List[str] = []
+    for code in hex_codes:
+        rgb = _hex_to_rgb(code)
+        if not rgb:
+            continue
+        hue, sat, val = _rgb_to_hsv(rgb)
+        if sat < 0.12 or val > 0.98 or val < 0.12:
+            continue  # neutral / white / black: allowed in every scheme
+        if not any(min(abs(hue - e), 360 - abs(hue - e)) <= tolerance_deg
+                   for e in expected_hues):
+            bad.append(code.upper())
+    return bad
 
 
 def _check_budget(
@@ -599,6 +997,70 @@ def _check_no_placeholders(design: Dict[str, Any], report: ValidationReport) -> 
         ))
     else:
         report.checks_passed += 1
+
+
+def _check_shopping_list(
+    design: Dict[str, Any],
+    brief: BriefConstraints,
+    cost: Optional[Dict[str, Any]],
+    report: ValidationReport,
+) -> None:
+    """Every line shown to the client must carry a real price.
+
+    This is the Rs 0 bug: the shopping list rendered at zero while the total
+    said Rs 24,900, because the rows and the total were calculated in two
+    places. The rows now come from the same costing as the total, and this
+    check refuses a row that has no unit price.
+    """
+    if not cost:
+        return
+    line_items = [i for i in (cost.get("line_items") or []) if isinstance(i, dict)]
+    report.checks_run += 1
+
+    zero = [
+        str(i.get("name", "unnamed")) for i in line_items
+        if int(i.get("unit_price_inr") or 0) <= 0
+    ]
+    if not line_items and brief.required_items:
+        report.violations.append(Violation(
+            code="empty_shopping_list",
+            severity=SEVERITY_ERROR,
+            message="The design has no priced shopping list, so there is nothing to buy.",
+            expected="at least one catalog-priced item",
+            actual="none",
+            remedy_hint="Select real catalog products for the brief.",
+        ))
+        return
+    if zero:
+        report.violations.append(Violation(
+            code="zero_price_item",
+            severity=SEVERITY_ERROR,
+            message=f"{len(zero)} shopping-list item(s) have no catalog price: {', '.join(zero[:3])}.",
+            expected="a catalog price for every line",
+            actual=", ".join(zero[:3]),
+            remedy_hint="Every item must resolve to a catalog SKU with a price.",
+        ))
+        return
+
+    # The total must equal the sum of the rows the client is looking at.
+    from app.engine.pricing import total_inr
+
+    rows_total = total_inr(line_items)
+    stated = int(cost.get("estimated_cost_inr") or 0)
+    if line_items and rows_total != stated:
+        report.violations.append(Violation(
+            code="total_line_mismatch",
+            severity=SEVERITY_ERROR,
+            message=(
+                f"The shopping list adds up to Rs {rows_total:,} but the stated "
+                f"total is Rs {stated:,}."
+            ),
+            expected=f"Rs {rows_total:,}",
+            actual=f"Rs {stated:,}",
+            remedy_hint="The total is computed from the rows; it must be their sum.",
+        ))
+        return
+    report.checks_passed += 1
 
 
 def _check_real_products(design: Dict[str, Any], report: ValidationReport) -> None:

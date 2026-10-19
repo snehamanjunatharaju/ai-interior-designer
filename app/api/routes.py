@@ -81,7 +81,7 @@ async def compute_layout(payload: DesignRequest) -> Dict[str, Any]:
             color_scheme=payload.color_scheme,
             budget_inr=payload.budget_amount_inr,
             vastu_compliance=payload.vastu_compliance.value,
-            room_dimensions=payload.room_dimensions or "",
+            room_dimensions=payload.dimension_text(),
         )
 
         dims = constraints.dimensions
@@ -176,30 +176,20 @@ async def proposal_pdf(payload: Dict[str, Any]) -> Any:
         # proposal reading "Rs 0" and "version n/a", because the PDF trusted a
         # `cost` key that was optional. Prices must come from the catalog here,
         # not from whatever the caller happened to send.
-        cost = payload.get("cost")
         source = design
         if not source.get("furniture") and isinstance(
             design.get("options"), list
         ) and design["options"]:
             source = design["options"][0]
 
+        # The PDF always prices from the catalog itself. A caller-supplied
+        # total was previously honoured, which let the document headline a
+        # figure that disagreed with its own shopping list - the same split
+        # the screen had. One calculation, one number, no exceptions.
         computed = None
         if isinstance(source, dict) and source.get("furniture"):
             computed = price_design(source, budget_inr=payload.get("budget_inr"))
-
-        if not isinstance(cost, dict) or "estimated_cost_inr" not in cost:
-            cost = computed
-        elif computed is not None:
-            # A caller-supplied total is honoured, but its shopping list is
-            # not trusted: a cost dict carrying only a figure produced a PDF
-            # with a headline number and no itemised list at all. Fill the
-            # priced detail from code and keep the caller's total.
-            merged = dict(cost)
-            for key in ("line_items", "budget_breakdown", "catalog_version",
-                        "cost_drivers", "cost_savings", "costing_complete"):
-                if not merged.get(key) and computed.get(key):
-                    merged[key] = computed[key]
-            cost = merged
+        cost = computed or payload.get("cost")
 
         pdf = build_proposal_pdf(
             design=design,
@@ -269,7 +259,26 @@ async def refine_design(payload: Dict[str, Any]) -> Dict[str, Any]:
         before = json.loads(json.dumps(design))
         updated = apply_refinement(dict(design), intent)
 
+        # A refusal changed nothing, so it reports the original total rather
+        # than costing a design that was not edited.
+        refund = updated.get("_refinement") or {}
+        if refund.get("refused"):
+            cost = price_design(before, budget_inr=payload.get("budget_inr"))
+            return {
+                "understood": False,
+                "message": refund.get("message", "That item is not in this design"),
+                "intent": intent.to_dict(),
+                "changed_fields": [],
+                "design": before,
+                "cost": cost,
+                "total_inr": cost["estimated_cost_inr"],
+                "available_items": refund.get("available", []),
+            }
+
         budget = payload.get("budget_inr")
+        # Same pricing call as the option card and the PDF. The edit step used
+        # to reprice independently and could report a different total from the
+        # one shown against the same line items.
         cost = price_design(updated, budget_inr=budget)
         plan = (
             build_phased_plan(cost["line_items"], budget)
@@ -295,6 +304,8 @@ async def refine_design(payload: Dict[str, Any]) -> Dict[str, Any]:
             "note": updated.get("_refinement", {}).get("note"),
             "design": updated,
             "cost": cost,
+            # The one number the screen, the edit step and the PDF all read.
+            "total_inr": cost["estimated_cost_inr"],
             "budget_plan": plan,
         }
 
@@ -326,7 +337,49 @@ async def score_vastu(payload: Dict[str, Any]) -> Dict[str, Any]:
             window_direction=payload.get("window_direction"),
             compliance=str(payload.get("compliance", "soft")),
         )
-        return report.to_dict()
+        result = report.to_dict()
+
+        # Vastu is a claim about orientation. Without a door and a window
+        # bearing there is no orientation to assess, and scoring anyway
+        # described a room the system had invented. The score is withheld and
+        # the assumption is labelled instead.
+        from app.engine.assumptions import has_bearings
+
+        bearings = has_bearings(
+            payload.get("door_direction"), payload.get("window_direction")
+        )
+        strict = str(payload.get("compliance", "soft")).lower() == "strict"
+        if not bearings:
+            missing = []
+            if not payload.get("door_direction"):
+                missing.append("door_direction")
+            if not payload.get("window_direction"):
+                missing.append("window_direction")
+            result["verifiable"] = False
+            result["score_withheld"] = True
+            result["withheld_reason"] = (
+                "Vastu is assessed against room orientation, and no bearing was "
+                f"supplied. Missing: {', '.join(missing)}. Supply these to get "
+                "a real Vastu assessment."
+            )
+            result["assumptions_made"] = [
+                {
+                    "field": field,
+                    "assumed": None,
+                    "reason": "Required for Vastu assessment; not supplied.",
+                }
+                for field in missing
+            ]
+            if strict:
+                # A Strict brief asked for a guarantee. Returning a number here
+                # would be inventing it, so the rules are returned unassessed.
+                result["rules"] = []
+                result["rule_count"] = 0
+        else:
+            result["verifiable"] = True
+            result["score_withheld"] = False
+
+        return result
 
 
 @router.get(

@@ -36,6 +36,7 @@ from reportlab.platypus import (
 )
 
 from app.core.observability import get_logger
+from app.core.money import indian_grouping
 import os
 
 logger = get_logger(__name__)
@@ -102,8 +103,11 @@ def _rupee(n: Any) -> str:
     from app.core.money import format_inr
 
     if _unicode_font() is None:
+        # No font can draw the sign, so use the Rs prefix - but keep Indian
+        # digit grouping, since that is about reading the number correctly
+        # rather than about the symbol.
         try:
-            return "Rs {:,}".format(int(n or 0))
+            return "Rs " + indian_grouping(int(n or 0))
         except (TypeError, ValueError):
             return "Rs 0"
     return format_inr(n)
@@ -154,9 +158,14 @@ def _unicode_font() -> Optional[str]:
             if not os.path.isfile(path):
                 continue
             try:
-                # Verify the glyph is actually present. A font can be Unicode
-                # and still lack U+20B9, and registering it would give a
-                # different wrong answer rather than the right one.
+                # Verify the glyph is actually present BEFORE registering.
+                # This check was missing and that was the whole bug: Arial
+                # Unicode on macOS loads cleanly but has no U+20B9, so the code
+                # reported a working font and the PDF rendered every rupee sign
+                # as the letter "n" ("n14,500") with no error anywhere.
+                font = TTFont("InteriorAIProbe", path)
+                if 0x20B9 not in font.face.charToGlyph:
+                    continue
                 pdfmetrics.registerFont(TTFont("InteriorAIUnicode", path))
                 _font_cache["name"] = "InteriorAIUnicode"
                 _font_cache["path"] = path
@@ -283,7 +292,12 @@ def build_proposal_pdf(
 
     flow: List[Any] = []
     cost = cost or {}
-    total = cost.get("estimated_cost_inr", 0)
+    # The same total function the option card and the edit step use, applied to
+    # the same rows. The PDF previously printed whatever headline figure it was
+    # handed, which is how it could disagree with its own line items.
+    from app.engine.pricing import total_inr
+
+    total = total_inr(cost.get("line_items") or []) or cost.get("estimated_cost_inr", 0)
 
     # ---- cover -------------------------------------------------------
     flow.append(Paragraph("Interior design proposal", styles["title"]))
@@ -365,21 +379,25 @@ def build_proposal_pdf(
             Paragraph("Brand", styles["cellb"]),
             Paragraph("Size (cm)", styles["cellb"]),
             Paragraph("Qty", styles["cellb"]),
+            Paragraph("Unit price", styles["cellb"]),
             Paragraph("Line total", styles["cellb"]),
         ]]
         for li in line_items:
             dims = li.get("dimensions_cm") or {}
+            qty = int(li.get("quantity", 1) or 1)
+            unit = int(li.get("unit_price_inr") or 0)
             rows.append([
                 Paragraph(str(li.get("name", "")), styles["cell"]),
                 Paragraph(str(li.get("brand", "")), styles["cell"]),
                 Paragraph("{}\u00d7{}\u00d7{}".format(
                     dims.get("width", 0), dims.get("depth", 0), dims.get("height", 0)
                 ), styles["cell"]),
-                Paragraph(str(li.get("quantity", 1)), styles["cell"]),
-                Paragraph(_rupee(li.get("line_total_inr", 0)), styles["cell"]),
+                Paragraph(str(qty), styles["cell"]),
+                Paragraph(_rupee(unit), styles["cell"]),
+                Paragraph(_rupee(unit * qty), styles["cell"]),
             ])
 
-        widths = [62 * mm, 34 * mm, 28 * mm, 12 * mm, 28 * mm]
+        widths = [56 * mm, 30 * mm, 24 * mm, 10 * mm, 22 * mm, 24 * mm]
         tbl = Table(rows, colWidths=widths, repeatRows=1)
         tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f9fafb")),
@@ -387,20 +405,20 @@ def build_proposal_pdf(
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("ALIGN", (3, 1), (4, -1), "RIGHT"),
+            ("ALIGN", (3, 1), (-1, -1), "RIGHT"),
         ]))
         flow.append(tbl)
         flow.append(Spacer(1, 6))
 
         total_row = [[
-            Paragraph("Total", styles["cellb"]), "", "", "",
+            Paragraph("Total", styles["cellb"]), "", "", "", "",
             Paragraph(_rupee(total), styles["cellb"]),
         ]]
         tt = Table(total_row, colWidths=widths)
         tt.setStyle(TableStyle([
             ("LINEABOVE", (0, 0), (-1, 0), 1, colors.HexColor("#9ca3af")),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("ALIGN", (4, 0), (4, 0), "RIGHT"),
+            ("ALIGN", (5, 0), (5, 0), "RIGHT"),
         ]))
         flow.append(tt)
 
@@ -478,9 +496,21 @@ def build_proposal_pdf(
             ))
             flow.append(Spacer(1, 4))
 
+    # ---- vastu notes ----------------------------------------------------
+    # Generated from the rule results, not from model prose, and printed
+    # separately from the trade-offs.
+    if design.get("vastu_notes"):
+        flow.append(Paragraph("Vastu notes", styles["h2"]))
+        flow.append(Paragraph(
+            "Generated from the rule-check results in code.", styles["small"]
+        ))
+        for note in design["vastu_notes"]:
+            flow.append(Paragraph("&bull;&nbsp;&nbsp;" + str(note), styles["body"]))
+        flow.append(Spacer(1, 4))
+
     # ---- trade-offs ----------------------------------------------------
     pros = design.get("pros") or []
-    cons = design.get("cons") or []
+    cons = design.get("trade_offs") or design.get("cons") or []
     if pros or cons:
         flow.append(Paragraph("Trade-offs", styles["h2"]))
         for label, items, colour in (("Strengths", pros, GOOD), ("Limitations", cons, WARN)):

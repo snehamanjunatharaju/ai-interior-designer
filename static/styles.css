@@ -317,6 +317,31 @@ textarea { resize: vertical; min-height: 62px; }
     font-weight: 640;
 }
 
+/* A score is withheld, not shown, while blocking issues remain. */
+.overall.withheld {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.option-price.fail .price { color: #b45309; }
+
+h4.sub { margin-top: 0.7rem; }
+
+.zone-sizes {
+    margin-top: 0.8rem;
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+.zone-sizes ul { padding-left: 1.1rem; margin: 0.3rem 0 0; }
+
+.refine-warn { color: #b45309; font-weight: 600; margin: 0 0 0.2rem; }
+
+.furniture tfoot td {
+    font-weight: 640;
+    border-top: 1px solid #d1d5db;
+}
+
 .score-row {
     display: grid;
     grid-template-columns: 130px 1fr 42px;

@@ -45,6 +45,13 @@ def _env_list(key: str, default: List[str]) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _default_llm_providers(environment: str) -> List[str]:
+    """Prefer hosted providers in production; keep local-first development."""
+    if environment.strip().lower() in {"production", "prod"}:
+        return ["openai", "anthropic"]
+    return ["ollama", "ivis", "openai", "anthropic"]
+
+
 class Settings:
     """
     Application settings resolved from the environment.
@@ -73,9 +80,32 @@ class Settings:
 
     # --- LLM providers (ordered by preference; first healthy one wins) ---
     LLM_PROVIDERS: List[str] = _env_list(
-        "LLM_PROVIDERS", ["ollama", "ivis", "openai", "anthropic"]
+        "LLM_PROVIDERS", _default_llm_providers(_env("ENVIRONMENT", "development"))
     )
-    DEFAULT_MODEL: str = _env("DEFAULT_MODEL", "gemma2:2b")
+
+    # The model used for the design pipeline.
+    #
+    # gemma2:2b was the default because it is fast and always present, but it
+    # is too small to hold a design together: it invents SKUs, emits malformed
+    # JSON often enough to need a repair layer, and writes pros and cons that
+    # are generic to the point of being useless. llama3.1:8b is the point where
+    # local generation becomes usable for this workload, so it leads.
+    #
+    # gemma2:2b remains a valid fast fallback: set LLM_FALLBACK_MODEL to it for
+    # a machine with limited RAM, or leave it as the second entry so a failed
+    # 8B load degrades instead of erroring.
+    DEFAULT_MODEL: str = _env("DEFAULT_MODEL", "llama3.1:8b")
+    FALLBACK_MODEL: str = _env("LLM_FALLBACK_MODEL", "gemma2:2b")
+    # Models tried in order until one reports healthy. The fallback keeps a
+    # machine without an 8B model working rather than failing every request.
+    MODEL_CANDIDATES: List[str] = _env_list(
+        "MODEL_CANDIDATES",
+        [_env("DEFAULT_MODEL", "llama3.1:8b"), _env("LLM_FALLBACK_MODEL", "gemma2:2b")],
+    )
+
+    # Ollama keeps the larger model resident between calls. Without this an 8B
+    # model is loaded into RAM on every request, which dominates latency.
+    OLLAMA_KEEP_ALIVE: str = _env("OLLAMA_KEEP_ALIVE", "10m")
 
     OLLAMA_BASE_URL: str = _env("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_TIMEOUT: float = _env_float("OLLAMA_TIMEOUT", 120.0)
@@ -108,6 +138,13 @@ class Settings:
     EMBEDDING_MODEL: str = _env("EMBEDDING_MODEL", "all-minilm-l6-v2")
     EMBEDDING_DIM: int = _env_int("EMBEDDING_DIM", 384)
     RAG_TOP_K: int = _env_int("RAG_TOP_K", 4)
+    # The retriever must return 3-5 passages. One passage at 0.014 similarity
+    # is not grounding - the architect was writing from model memory and the
+    # citation was decoration. If too few passages clear the filter, the
+    # service relaxes the filter until it reaches the floor rather than
+    # returning a single weak hit.
+    RAG_MIN_PASSAGES: int = _env_int("RAG_MIN_PASSAGES", 3)
+    RAG_MAX_PASSAGES: int = _env_int("RAG_MAX_PASSAGES", 5)
     RAG_MIN_SCORE: float = _env_float("RAG_MIN_SCORE", 0.15)
     RERANK_ENABLED: bool = _env_bool("RERANK_ENABLED", True)
 

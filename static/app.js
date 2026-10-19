@@ -147,24 +147,34 @@
 
     // ------------------------------------------------------------ rendering
 
-    async function renderLayout(payload) {
-        // The plan is a pure function of the brief and the catalog, so it
-        // needs no LLM call and can be drawn before the design finishes.
+    async function renderLayout(payload, data) {
+        // Once a design exists, the plan shipped with the first option is the
+        // authority: it is computed from the same priced line items the
+        // shopping list shows, with the door and window bearings from the
+        // form. Before that, /layout draws a provisional plan from the brief
+        // while the model is still thinking.
         const panel = $("layoutPanel");
         if (!panel) return;
+        const shipped = data && data.options && data.options[0]
+            && data.options[0].layout;
         try {
-            const res = await fetch("/api/v1/layout", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            });
-            if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                panel.hidden = true;
-                $("layoutMeta").textContent = err.detail || "No plan available.";
-                return;
+            let plan;
+            if (shipped && shipped.items) {
+                plan = shipped;
+            } else {
+                const res = await fetch("/api/v1/layout", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    panel.hidden = true;
+                    $("layoutMeta").textContent = err.detail || "No plan available.";
+                    return;
+                }
+                plan = await res.json();
             }
-            const plan = await res.json();
             panel.hidden = false;
             currentLayout = plan;
             wireTabs();
@@ -175,12 +185,33 @@
             $("planLegend").appendChild(LayoutView.legend(cats));
 
             const s = plan.score || {};
-            $("layoutMeta").innerHTML =
+            const room = plan.room || {};
+            // The exact dimensions the client entered, with the area and the
+            // bearings actually used, so the plan is traceable to the form.
+            const dimChip = room.dimension_text
+                ? `<span class="chip">${esc(room.dimension_text)} · ${room.area_sqft || "?"} sq ft</span>`
+                : "";
+            const bearingChip = room.door_direction || room.window_direction
+                ? `<span class="chip">door ${esc(room.door_direction || "—")} · window ${esc(room.window_direction || "—")}</span>`
+                : "";
+            $("layoutMeta").innerHTML = dimChip + bearingChip +
                 `<span class="chip ${s.errors ? "bad" : "good"}">${
                     s.errors ? `${s.errors} conflict${s.errors > 1 ? "s" : ""}` : "No conflicts"
                 }</span>` +
                 (s.unplaced ? ` <span class="chip warn">${s.unplaced} unplaced</span>` : "") +
                 ` <span class="chip">score ${s.overall}</span>`;
+
+            // Approximate zone sizes, so "how big is the study corner?" has an
+            // answer taken from the plan itself.
+            if (plan.zones && plan.zones.length) {
+                $("planLegend").innerHTML += `
+                    <div class="zone-sizes">
+                      <strong>Zone sizes (approx.)</strong>
+                      <ul>${plan.zones.map((z) =>
+                        `<li>${esc(z.label)}: ${z.approx_width_ft} × ${z.approx_depth_ft} ft (${z.approx_area_sqft} sq ft)</li>`
+                      ).join("")}</ul>
+                    </div>`;
+            }
 
             const issues = (plan.issues || []).concat(
                 (plan.unplaced || []).map((u) => ({
@@ -202,8 +233,21 @@
             // Vastu scores the measured layout, so it has to wait for this
             // promise to resolve. Calling it alongside the request meant
             // currentLayout was still null and the panel silently stayed
-            // hidden.
-            if (typeof renderVastu === "function") {
+            // hidden. When the design shipped its own rule results, those are
+            // used - they are the same assessment the validator blocked on.
+            const shippedVastu = data && data.options && data.options[0]
+                && data.options[0].vastu_results;
+            if (shippedVastu && shippedVastu.length) {
+                const first = data.options[0];
+                showVastu({
+                    score: first.vastu_score != null ? first.vastu_score : 0,
+                    grade: "",
+                    passed: shippedVastu.filter((r) => r.passed).length,
+                    total: shippedVastu.length,
+                    results: shippedVastu,
+                    notes: first.vastu_notes || [],
+                });
+            } else if (typeof renderVastu === "function") {
                 renderVastu(lastPayload || buildPayload());
             }
             // If the client is already looking at the 3D tab, draw it now
@@ -241,14 +285,35 @@
                 }),
             });
             if (!res.ok) { panel.hidden = true; return; }
-            const v = await res.json();
+            showVastu(await res.json());
+        } catch (e) {
+            panel.hidden = true;
+        }
+    }
+
+    function showVastu(v) {
+        const panel = $("vastuPanel");
+        if (!panel) return;
+        {
             currentVastu = v;
             panel.hidden = false;
 
+            const strict = lastPayload && lastPayload.vastu_compliance === "strict";
+            // Under Strict, any failed strong rule means the score must not
+            // read as a pass - the same rule the brief check applies.
+            const failedStrong = (v.results || []).some(
+                (r) => !r.passed && r.severity === "error"
+            );
+            const ok = v.score >= 75 && !(strict && failedStrong);
             $("vastuMeta").innerHTML =
-                `<span class="chip ${v.score >= 75 ? "good" : v.score >= 60 ? "warn" : "bad"}">` +
-                `${v.score} / 100</span> <span class="chip">${esc(v.grade)}</span>` +
-                ` <span class="chip">${v.passed} of ${v.total} rules</span>`;
+                `<span class="chip ${ok ? "good" : v.score >= 60 ? "warn" : "bad"}">` +
+                `${v.score} / 100</span>` +
+                (v.grade ? ` <span class="chip">${esc(v.grade)}</span>` : "") +
+                ` <span class="chip">${v.passed} of ${v.total} rules</span>` +
+                (strict && failedStrong
+                    ? ` <span class="chip bad">Strict: rule failed</span>`
+                    : "");
+            $("vastuBody").dataset.ready = "1";
 
             const rows = (v.results || []).map((r) => {
                 const cls = r.passed ? "pass" : r.severity === "error" ? "error" : "warning";
@@ -268,8 +333,6 @@
                 ? `<p class="muted small">Add ${esc(v.missing_inputs.join(" and ").replace(/_/g, " "))} for a fuller score.</p>`
                 : "";
             $("vastuBody").innerHTML = rows + notes + missing;
-        } catch (e) {
-            panel.hidden = true;
         }
     }
 
@@ -295,6 +358,38 @@
         }
     }
 
+    // Build the same shape `renderOption` expects from a refine response, so
+    // the edit step and the option card share one price calculation server-side.
+    function _optionFromRefine(design, data) {
+        const cost = data.cost || {};
+        return {
+            title: design.title,
+            concept: design.concept,
+            layout_description: design.layout_description,
+            zones: design.zones,
+            lighting_plan: design.lighting_plan,
+            storage_strategy: design.storage_strategy,
+            decor_suggestions: design.decor_suggestions,
+            vastu_notes: design.vastu_notes,
+            trade_offs: design.trade_offs,
+            pros: design.pros,
+            cons: design.cons,
+            color_palette: design.color_palette,
+            estimated_cost_inr: data.total_inr != null
+                ? data.total_inr : cost.estimated_cost_inr,
+            shopping_list: (cost.line_items || []).map((li) => ({
+                sku: li.sku,
+                name: li.name,
+                brand: li.brand,
+                quantity: li.quantity,
+                unit_price_inr: li.unit_price_inr,
+                line_total_inr: li.line_total_inr,
+            })),
+            validation: data.validation || null,
+            layout: design.layout || null,
+        };
+    }
+
     async function runRefine() {
         const input = $("refineInput");
         const text = input.value.trim();
@@ -314,13 +409,22 @@
                 }),
             });
             const data = await res.json();
+            // A request that names something absent ("make the desk bigger" in
+            // a kitchen) is refused explicitly and changes nothing - it used to
+            // silently edit an unrelated item and report "Add chair only".
             if (!data.understood) {
                 if (out) out.innerHTML =
-                    `<p class="muted small">${esc(data.message || "Could not tell what to change.")}</p>`;
+                    `<p class="refine-warn">${esc(data.message || "Could not tell what to change.")}</p>`;
                 return;
             }
             currentDesign = data.design;
-            renderOptions([data.design]);
+            // The edited design is repriced into the option shape before it is
+            // redrawn, so the card shows the same quantity/unit/line rows and
+            // the same total the edit step reports.
+            const repriced = data.design && data.cost
+                ? _optionFromRefine(data.design, data)
+                : data.design;
+            renderOptions([repriced]);
             if (data.cost && data.cost.line_items) {
                 renderBudgetPlan(data.budget_plan);
             }
@@ -329,7 +433,9 @@
                 out.innerHTML =
                     `<p class="refine-ok">Updated: <strong>${esc(changed)}</strong></p>` +
                     `<p class="muted small">${esc(data.message)}</p>` +
-                    (data.cost ? `<p class="muted small">New total ${inr(data.cost.estimated_cost_inr)}</p>` : "");
+                    (data.total_inr != null
+                        ? `<p class="muted small">New total ${inr(data.total_inr)}</p>`
+                        : "");
             }
             input.value = "";
         } catch (e) {
@@ -512,9 +618,14 @@
             ${plan.phase2 && plan.phase2.line_items && plan.phase2.line_items.length ? phase(plan.phase2) : ""}`;
     }
 
-    function renderEvaluation(evaluation) {
+    function renderEvaluation(evaluation, validation) {
         if (!evaluation || !evaluation.scores) return;
         const box = $("evaluation");
+        // A high score next to blocking issues is the contradiction the client
+        // sees first. When the code check has blocking issues, the overall is
+        // shown as "withheld" rather than as a good-looking number.
+        const blocking = ((validation && validation.violations) || [])
+            .filter((v) => v.severity === "error");
         const rows = Object.entries(evaluation.scores)
             .map(([k, v]) => {
                 const pct = Math.max(0, Math.min(100, (Number(v) / 10) * 100));
@@ -527,14 +638,25 @@
             })
             .join("");
 
+        const overall = blocking.length
+            ? `<span class="overall withheld" title="Blocking brief-check issues remain">score withheld</span>`
+            : `<span class="overall">${Number(evaluation.overall || 0).toFixed(1)}/10</span>`;
+
+        // "Remaining issues", not "Issues addressed". The critic's list is
+        // what is still wrong, and labelling it as fixed was exactly backwards.
+        const remaining = evaluation.remaining_issues || evaluation.issues || [];
+
         box.innerHTML = `
-            <h3>Critic Evaluation <span class="overall">${Number(evaluation.overall || 0).toFixed(1)}/10</span></h3>
-            ${rows}
-            ${evaluation.issues && evaluation.issues.length
-                ? `<div class="issues"><strong>Issues addressed:</strong><ul>${
-                    evaluation.issues.map((i) => `<li>${esc(i)}</li>`).join("")
-                }</ul></div>`
+            <h3>Critic Evaluation ${overall}</h3>
+            ${blocking.length
+                ? `<p class="muted small">${blocking.length} blocking brief-check issue(s) remain, so the score is not shown as a pass.</p>`
                 : ""}
+            ${rows}
+            ${remaining.length
+                ? `<div class="issues"><strong>Remaining issues:</strong><ul>${
+                    remaining.map((i) => `<li>${esc(i)}</li>`).join("")
+                }</ul></div>`
+                : `<div class="issues"><strong>Remaining issues:</strong> none</div>`}
         `;
         box.hidden = false;
     }
@@ -547,7 +669,11 @@
                 <div class="source">
                     <div class="source-head">
                         <span class="source-name">${esc(s.source || "knowledge")}</span>
-                        <span class="source-score">${Number(s.score).toFixed(3)}</span>
+                        <span class="source-score">${
+                            (s.metadata && s.metadata.dense_similarity != null)
+                                ? `similarity ${Number(s.metadata.dense_similarity).toFixed(3)}`
+                                : `rank score ${Number(s.score).toFixed(3)}`
+                        }</span>
                     </div>
                     <p>${esc(s.content)}</p>
                 </div>`
@@ -562,16 +688,41 @@
     }
 
     function renderOption(option, index) {
-        const furniture = (option.furniture || [])
+        // One row per shopping-list line: quantity, unit price, and the line
+        // total the option total is summed from. Prices come from the server's
+        // `shopping_list`, which is computed from the catalog - the same rows
+        // the total uses. Building rows from the model's fields is what made
+        // every item show ₹0 next to a real total.
+        const rows = option.shopping_list && option.shopping_list.length
+            ? option.shopping_list
+            : (option.furniture || []).map((f) => ({
+                name: f.name,
+                brand: (f.brand_suggestions || [])[0] || "—",
+                quantity: f.quantity || 1,
+                unit_price_inr: f.unit_price_inr || 0,
+                line_total_inr: f.unit_price_inr
+                    ? f.unit_price_inr * (f.quantity || 1)
+                    : (f.line_total_inr || 0),
+            }));
+        const furniture = rows
             .map(
                 (f) => `
                 <tr>
-                    <td>${esc(f.name)}${f.quantity > 1 ? ` <span class="qty">×${f.quantity}</span>` : ""}</td>
-                    <td>${esc((f.brand_suggestions || []).slice(0, 2).join(", ") || "—")}</td>
-                    <td class="num">${inr(f.line_total_inr || f.estimated_price_inr)}</td>
+                    <td>${esc(f.name)}</td>
+                    <td>${esc(f.brand || "—")}</td>
+                    <td class="num">${f.quantity}</td>
+                    <td class="num">${inr(f.unit_price_inr)}</td>
+                    <td class="num">${inr(f.line_total_inr)}</td>
                 </tr>`
             )
             .join("");
+        // The option total is the sum of the rows above it, computed once.
+        const shoppingTotal = rows.reduce(
+            (sum, f) => sum + Number(f.line_total_inr || 0), 0
+        );
+        const optionValidation = option.validation || null;
+        const optionBlocking = ((optionValidation && optionValidation.violations) || [])
+            .filter((v) => v.severity === "error");
 
         const breakdown = (option.budget_breakdown || [])
             .map(
@@ -606,13 +757,18 @@
                 ? `<ul class="${cls}">${arr.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`
                 : "";
 
+        const dims = option.layout && option.layout.room;
+        const zones = option.layout && option.layout.zones;
+
         return `
         <article class="option">
             <div class="option-head">
                 <h3>Option ${index + 1}: ${esc(option.title)}</h3>
-                <div class="option-price">
-                    <span class="price">${inr(option.estimated_cost_inr)}</span>
-                    <span class="price-label">estimated total</span>
+                <div class="option-price ${optionBlocking.length ? "fail" : ""}">
+                    <span class="price">${inr(shoppingTotal || option.estimated_cost_inr)}</span>
+                    <span class="price-label">${optionBlocking.length
+                        ? `estimated total · ${optionBlocking.length} blocking issue(s)`
+                        : "estimated total, summed from the list below"}</span>
                 </div>
             </div>
 
@@ -622,9 +778,15 @@
 
             <div class="option-grid">
                 <div class="opt-col">
-                    <h4>Layout</h4>
+                    <h4>Layout${dims ? ` <span class="hint">${esc(dims.dimension_text || "")}</span>` : ""}</h4>
                     <p>${esc(option.layout_description)}</p>
                     ${list(option.zones, "zone-list")}
+                    ${zones && zones.length
+                        ? `<h4 class="sub">Zone sizes <span class="hint">approximate</span></h4>
+                           <ul class="zone-list">${zones.map((z) =>
+                               `<li>${esc(z.label)}: about ${z.approx_width_ft} × ${z.approx_depth_ft} ft (${z.approx_area_sqft} sq ft)</li>`
+                           ).join("")}</ul>`
+                        : ""}
                 </div>
                 <div class="opt-col">
                     <h4>Lighting</h4>
@@ -637,8 +799,9 @@
             ${furniture
                 ? `<h4>Shopping List</h4>
                    <table class="furniture">
-                     <thead><tr><th>Item</th><th>Brand</th><th class="num">Price</th></tr></thead>
+                     <thead><tr><th>Item</th><th>Brand</th><th class="num">Qty</th><th class="num">Unit price</th><th class="num">Line total</th></tr></thead>
                      <tbody>${furniture}</tbody>
+                     <tfoot><tr><td colspan="4">Total</td><td class="num">${inr(shoppingTotal)}</td></tr></tfoot>
                    </table>`
                 : ""}
 
@@ -650,13 +813,16 @@
                 ? `<h4>Decor</h4>${list(option.decor_suggestions, "decor-list")}`
                 : ""}
 
+            ${option.trade_offs && option.trade_offs.length
+                ? `<h4>Trade-offs</h4>${list(option.trade_offs, "cons")}`
+                : (option.cons && option.cons.length ? `<h4>Trade-offs</h4>${list(option.cons, "cons")}` : "")}
+
             ${option.vastu_notes && option.vastu_notes.length
-                ? `<h4>Vastu Notes</h4>${list(option.vastu_notes, "vastu-list")}`
+                ? `<h4>Vastu Notes <span class="hint">generated from the rule check${option.vastu_score != null ? ` · scored ${option.vastu_score}/100` : ""}</span></h4>${list(option.vastu_notes, "vastu-list")}`
                 : ""}
 
             <div class="option-foot">
                 ${list(option.pros, "pros")}
-                ${list(option.cons, "cons")}
             </div>
         </article>`;
     }
@@ -720,9 +886,9 @@
                         renderValidation(data.validation);
                         renderBudgetPlan(data.budget_plan);
                         renderOptions(data.options || []);
-                        renderEvaluation(data.evaluation);
+                        renderEvaluation(data.evaluation, data.validation);
                         renderSources(data.context_sources);
-                        renderLayout(payload);
+                        renderLayout(payload, data);
                         _afterResult(data, payload);
                     }
                 }
@@ -753,9 +919,9 @@
         renderValidation(data.validation);
         renderBudgetPlan(data.budget_plan);
         renderOptions(data.options || []);
-        renderEvaluation(data.evaluation);
+        renderEvaluation(data.evaluation, data.validation);
         renderSources(data.context_sources);
-        renderLayout(payload);
+        renderLayout(payload, data);
         _afterResult(data, payload);   // floor plan is independent of the LLM run
     }
 

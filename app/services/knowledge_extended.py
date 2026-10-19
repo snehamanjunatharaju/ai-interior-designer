@@ -722,4 +722,148 @@ EXTENDED_KNOWLEDGE: List[Dict[str, str]] = [
             "is not."
         ),
     },
+    # ==================================================================
+    # Kitchen ergonomics
+    # ==================================================================
+    {
+        "source": "Kitchen ergonomics",
+        "category": "kitchen",
+        "content": (
+            "The kitchen work triangle joins the sink, the hob and the "
+            "refrigerator. Each leg should be 1.2-2.7 m and the sum under "
+            "about 6.5 m, so a cook takes no more than two steps between the "
+            "three. Counter height is 85-90 cm for adults and 80-85 cm for a "
+            "short cook; the upper cabinets are hung 45-55 cm above the "
+            "counter and no deeper than 35 cm, so the head is not at them."
+        ),
+    },
+    {
+        "source": "Kitchen ergonomics",
+        "category": "kitchen",
+        "content": (
+            "A modular kitchen in an Indian apartment needs a minimum "
+            "circulation of 90 cm between parallel counters, and 100 cm if "
+            "two people cook together. Put daily-use items in a drawer bank "
+            "between knee and eye level, not above the fridge. A tall unit "
+            "holds a month of dry groceries; open shelves belong where jars "
+            "are used daily, never over the hob where grease settles."
+        ),
+    },
+    # ==================================================================
+    # Ventilation for Indian cooking
+    # ==================================================================
+    {
+        "source": "Kitchen ventilation, India",
+        "category": "kitchen",
+        "content": (
+            "Indian cooking - tempering, deep frying, masala roasted in "
+            "oil - produces far more grease and smoke than a Western hob, so "
+            "a chimney is not optional in a semi-open kitchen. A 60 cm "
+            "auto-clean chimney with 1,000-1,200 m3/hr suction is the minimum "
+            "for a standard 90 cm hob; mount it 60-65 cm above the hob. "
+            "Where ducting is impossible, a 250 mm exhaust fan through an "
+            "external wall is the budget alternative and must not recirculate "
+            "into the living room."
+        ),
+    },
+    {
+        "source": "Kitchen ventilation, India",
+        "category": "kitchen",
+        "content": (
+            "Vastu places the kitchen in the south-east, called the agni "
+            "corner, and asks the cook to face east at the hob. That working "
+            "position also decides ventilation: the chimney run is short if "
+            "the hob sits against the south-east external wall, and the "
+            "window on the north-east supplies cross-ventilation. A hob on "
+            "an internal wall needs a ducted run of 2-3 m and loses 20-30% "
+            "of suction."
+        ),
+    },
+    # ==================================================================
+    # Japanese style
+    # ==================================================================
+    {
+        "source": "Japanese interiors",
+        "category": "style",
+        "content": (
+            "Japanese interiors are built on three ideas: restraint, low "
+            "furniture and natural materials. A room reads Japanese when the "
+            "floor is visible - low platform beds, a 30-35 cm high coffee "
+            "table, seating that sits near the floor - and when storage is "
+            "hidden behind sliding panels rather than shown as open shelving. "
+            "Low furniture is not a style preference in a small apartment: "
+            "it persists the sightline and makes a 9 x 11 ft room read larger."
+        ),
+    },
+    {
+        "source": "Japanese interiors",
+        "category": "style",
+        "content": (
+            "The Japanese palette is quiet and comes from materials rather "
+            "than paint: pale oak or walnut, rice paper, undyed cotton, "
+            "charcoal and warm off-white, with a single accent such as "
+            "matte black. Texture carries the room - a woven rug, a ceramic "
+            "vase, linen curtains - because colour is deliberately limited. "
+            "Wabi-sabi asks for one imperfect, handmade thing rather than a "
+            "set of identical cushions."
+        ),
+    },
+    # ==================================================================
+    # Budget materials, Indian market
+    # ==================================================================
+    {
+        "source": "Budget materials, India",
+        "category": "materials",
+        "content": (
+            "Low-budget Indian interiors get their value from materials "
+            "that survive daily use. Vitrified tiles give 60-70% of the look "
+            "of marble at a fraction of the cost and do not stain. BWR "
+            "plywood costs 20-30% more than commercial plywood and is the "
+            "right choice for kitchen carcasses in a humid city. Laminate "
+            "counters cost about a third of quartz and are adequate if seams "
+            "are sealed; quartz is worth it around the sink."
+        ),
+    },
+    {
+        "source": "Budget materials, India",
+        "category": "materials",
+        "content": (
+            "Where to save and where not to, in an Indian apartment on a "
+            "tight budget: save on decor, wall art, lampshades and the "
+            "sofa's upholstery fabric; spend on the mattress, the kitchen "
+            "hardware (hinges and channels), the water-proofing and the "
+            "wardrobe internals. The rule of thumb is that anything opened "
+            "several times a day should be bought at the top of the budget, "
+            "and anything looked at once a week can be bought cheap."
+        ),
+    },
+    # ==================================================================
+    # Kids' safety
+    # ==================================================================
+    {
+        "source": "Kids' room safety",
+        "category": "safety",
+        "content": (
+            "A children's room is designed against falls first. Anything "
+            "taller than 60 cm - a bookshelf, a wardrobe, a chest of "
+            "drawers - must be anchored to a studded wall; a five-drawer "
+            "chest tip-over is caused by an open drawer, not by climbing. "
+            "Beds are 40-45 cm high for a child under six, with a rail on "
+            "the sleeping side, and the gap between the bed and the wall "
+            "is closed so a child cannot wedge in."
+        ),
+    },
+    {
+        "source": "Kids' room safety",
+        "category": "safety",
+        "content": (
+            "Choose materials a child can be around: low-VOC or zero-VOC "
+            "paint with no added lead, water-based finishes on furniture, "
+            "and no glass-topped tables. Rugs need an anti-skid backing on "
+            "smooth tile. Socket covers and a blind cord cleat are cheap "
+            "and are what parents actually notice; a bed lamp rated 3000K "
+            "and set on a switch by the door lets a child move at night "
+            "without a floor-level cable to trip on."
+        ),
+    },
 ]

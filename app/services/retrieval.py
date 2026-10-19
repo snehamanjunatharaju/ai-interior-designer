@@ -60,7 +60,16 @@ class RetrievalService:
             dim = self._embedder.dim
 
             store = VectorStore.load(dim, settings.VECTOR_STORE_PATH)
-            if store.is_empty or force:
+            # A persisted store built from an older corpus has to be rebuilt.
+            # Otherwise passages added later are in the BM25 index but not the
+            # vectors, so half the retriever cannot see them.
+            corpus_size = len(get_knowledge_base())
+            stored = int((store.stats() or {}).get("chunks") or 0)
+            if store.is_empty or force or stored != corpus_size:
+                logger.info(
+                    "kb_rebuild stored=%d corpus=%d", stored, corpus_size,
+                )
+                store = VectorStore(dim, settings.VECTOR_STORE_PATH)
                 self._build_index(store)
             else:
                 # The persisted store skips embedding, but the lexical index
@@ -153,6 +162,7 @@ class RetrievalService:
         style: Optional[str] = None,
         budget_tier: Optional[str] = None,
         require_vastu: bool = False,
+        pool: Optional[int] = None,
     ) -> List[RetrievedContext]:
         """
         Retrieve the most relevant knowledge chunks for a query.
@@ -173,9 +183,11 @@ class RetrievalService:
             return []
 
         top_k = top_k or settings.RAG_TOP_K
+        # An explicit `top_k` is honoured (an API caller asking for 2 gets 2).
+        # Only the request-wide retrieve applies the 3-5 band.
         # The fused score is a rank score, not a cosine, so RAG_MIN_SCORE no
         # longer applies here; it stays for the dense-only path.
-        pool = max(top_k * 4, 20)
+        pool = pool or max(top_k * 4, 20)
 
         with tracer.start("rag.retrieve", query=query[:80]):
             qvec = self._embedder.embed(query)
@@ -186,6 +198,8 @@ class RetrievalService:
             dense_ranked = [
                 (int(c.metadata.get("index", 0)), float(s)) for c, s in dense
             ]
+            dense_similarity = {idx: score for idx, score in dense_ranked}
+            lexical_score = {idx: score for idx, score in lexical}
             fused = reciprocal_rank_fusion([dense_ranked, lexical])
 
             entries = self._entries or get_knowledge_base()
@@ -212,6 +226,11 @@ class RetrievalService:
                         "styles": entry.get("styles", []),
                         "budget_tiers": entry.get("budget_tiers", []),
                         "vastu": bool(entry.get("vastu", False)),
+                        # `score` is the fused RRF rank score (top hit ~1/61),
+                        # which is not a similarity and must not be presented
+                        # as one. The real cosine and BM25 figures are here.
+                        "dense_similarity": round(dense_similarity.get(idx, 0.0), 4),
+                        "lexical_score": round(lexical_score.get(idx, 0.0), 3),
                     },
                 ))
                 if len(picked) >= top_k:
@@ -234,15 +253,68 @@ class RetrievalService:
 
         Room, style, and budget are already known from the form, so spending
         recall on guidance for the wrong kind of room is pure waste.
+
+        Returns 3-5 passages. One passage at 0.014 similarity is not grounding:
+        the architect then wrote from model memory and the citation was
+        decoration. When the filters are stricter than the corpus, the filters
+        are relaxed until the floor is reached - a passage with no room tag is
+        general advice and still applies.
         """
-        return await self.retrieve(
-            self.build_query(request),
-            top_k=top_k,
+        target = max(
+            settings.RAG_MIN_PASSAGES,
+            min(top_k or settings.RAG_TOP_K, settings.RAG_MAX_PASSAGES),
+        )
+        # The relevant corpus is small (a handful of kitchen passages), so the
+        # candidate pool has to be wide enough that relaxing a filter can
+        # actually find them rather than settling on whatever was already in
+        # the top four.
+        pool = max(target * 8, 40)
+        filters = dict(
             room=request.room_type.value,
             style=request.style.value,
             budget_tier=request.budget.value,
             require_vastu=request.vastu_compliance.value == "strict",
         )
+        query = self.build_query(request)
+        results = await self.retrieve(
+            query, top_k=target, **filters, pool=pool
+        )
+        if len(results) >= min(target, settings.RAG_MIN_PASSAGES):
+            return results
+
+        # A genuinely relevant passage for this room outranks a generic one,
+        # so a room match is tried without the style and budget tags first.
+        by_room = await self.retrieve(
+            query, top_k=target, room=filters["room"], pool=pool
+        )
+        if len(by_room) > len(results):
+            results = by_room
+        if len(results) >= min(target, settings.RAG_MIN_PASSAGES):
+            return results
+
+        picked_content = {c.content for c in results}
+        # Relax the most restrictive filters first, one at a time. The earlier
+        # version relaxed style before budget, and a kitchen brief whose style
+        # matched nothing left the room filter in place until the last
+        # fallback - which is why it came back with two passages, neither
+        # about kitchens. Budget is the least important filter for grounding.
+        for relaxed in (
+            {**filters, "require_vastu": False},
+            {**filters, "require_vastu": False, "budget_tier": None},
+            {**filters, "budget_tier": None, "style": None},
+            {**filters, "require_vastu": False, "budget_tier": None, "style": None},
+            {},
+        ):
+            extra = await self.retrieve(query, top_k=target, **relaxed, pool=pool)
+            for ctx in extra:
+                if ctx.content in picked_content:
+                    continue
+                ctx.metadata = {**ctx.metadata, "filter_relaxed": True}
+                results.append(ctx)
+                picked_content.add(ctx.content)
+                if len(results) >= target:
+                    return results
+        return results
 
     # -- reranking ---------------------------------------------------------
 

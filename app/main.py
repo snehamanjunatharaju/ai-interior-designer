@@ -68,6 +68,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     up = [n for n, h in provider_health.items() if h["reachable"]]
     logger.info("providers_ready reachable=%s all=%s", up, list(provider_health))
 
+    # Resolve which model this machine can actually run. A healthy Ollama says
+    # nothing about whether the requested model is pulled, and discovering that
+    # on the user's first request turns a configuration preference into a 500.
+    # Resolving at startup logs the downgrade instead.
+    try:
+        chosen = await registry.use_best_available_model()
+        if chosen != settings.DEFAULT_MODEL:
+            logger.warning(
+                "model_downgraded requested=%s using=%s (preferred model not "
+                "available locally)", settings.DEFAULT_MODEL, chosen,
+            )
+    except Exception as exc:
+        logger.warning("model_resolution_failed error=%s", exc)
+
     yield
 
     logger.info("shutting_down app=%s", settings.APP_NAME)

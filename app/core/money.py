@@ -38,7 +38,7 @@ def format_inr(amount: Any, *, with_symbol: bool = True) -> str:
         value = int(round(float(amount or 0)))
     except (TypeError, ValueError):
         value = 0
-    grouped = _indian_grouping(abs(value))
+    grouped = indian_grouping(abs(value))
     sign = "-" if value < 0 else ""
     prefix = RUPEE if with_symbol else ""
     return f"{sign}{prefix}{grouped}"
@@ -65,7 +65,7 @@ def format_inr_words(amount: Any) -> str:
     return format_inr(-value if sign else value)
 
 
-def _indian_grouping(value: int) -> str:
+def indian_grouping(value: int) -> str:
     """
     Group digits as 1,23,456 rather than 123,456.
 

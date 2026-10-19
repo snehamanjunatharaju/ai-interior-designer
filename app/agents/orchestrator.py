@@ -38,7 +38,9 @@ from app.core.schemas import (
     RetrievedContext,
 )
 from app.engine.brief import BriefConstraints, parse_brief
-from app.engine.pricing import build_phased_plan, price_design
+from app.engine.assumptions import assess_assumptions
+from app.engine.diversity import describe_rejection, select_distinct
+from app.engine.pricing import build_phased_plan, price_design, total_inr
 from app.engine.contracts import (
     validate_proposal as validate_selection,
     selections_to_furniture,
@@ -52,8 +54,6 @@ logger = get_logger(__name__)
 # How many consecutive revisions may fail to improve before the reflection
 # loop gives up. One flat round is normal - the model may be addressing a
 # different violation - but two in a row means it is not converging.
-STALL_LIMIT = 2
-
 DESIGNER_SYSTEM_PROMPT = """You are a senior interior designer with 15 years of \
 experience in the Indian residential market. You have deep knowledge of Vastu, Indian \
 climates, space constraints of Indian apartments, local brands, and INR pricing. You \
@@ -121,8 +121,18 @@ def _text(value: Any, limit: int = 0) -> str:
     return out[:limit] if limit else out
 
 
-def _brief_to_text(request: DesignRequest) -> str:
-    """Render a design brief as a compact structured block for prompting."""
+def _brief_to_text(
+    request: DesignRequest, brief: Optional[BriefConstraints] = None
+) -> str:
+    """Render the structured brief as a compact block for prompting.
+
+    Every field is read from the one brief object every agent shares. The
+    door and window directions were previously dropped from this rendering
+    entirely (the model was told the dimensions but never the bearings), and
+    the colour scheme was passed as the raw select value, so "Warm Earthy"
+    reached the model as the string "Warm Earthy" with no palette and no
+    constraint behind it.
+    """
     budget_amount = request.budget_amount_inr or {
         "low": 150_000,
         "medium": 800_000,
@@ -130,17 +140,98 @@ def _brief_to_text(request: DesignRequest) -> str:
         "luxury": 10_000_000,
     }.get(request.budget.value, 800_000)
 
-    return f"""ROOM TYPE: {request.room_type.value.replace('_', ' ').title()}
-STYLE: {request.style.value.replace('_', ' ')}
-COLOUR SCHEME: {request.color_scheme}
+    brief = brief or parse_brief(
+        client_preferences=request.client_preferences,
+        furniture=request.furniture,
+        specific_requirements=request.specific_requirements,
+        occupants=request.occupants,
+        room_type=request.room_type.value,
+        style=request.style.value,
+        color_scheme=request.color_scheme,
+        budget_inr=request.budget_amount_inr,
+        vastu_compliance=request.vastu_compliance.value,
+        room_dimensions=request.dimension_text(),
+        door_direction=request.door_direction,
+        window_direction=request.window_direction,
+        lifestyle_notes=request.lifestyle_notes,
+    )
+
+    dimensions = brief.dimensions
+    if dimensions.is_known():
+        dims = (
+            f"{dimensions.width_cm} cm x {dimensions.length_cm} cm "
+            f"({dimensions.width_ft:g} ft x {dimensions.length_ft:g} ft), "
+            f"area {dimensions.area_sqft:g} sq ft"
+        )
+    else:
+        dims = "not specified - assume a standard Indian apartment room"
+
+    palette = brief.palette or {}
+    palette_line = ""
+    if palette:
+        palette_line = (
+            f"PALETTE (fixed by the selected scheme - use exactly these colours): "
+            f"{palette.get('label')} - primary {palette.get('primary')}, "
+            f"secondary {palette.get('secondary')}, accent {palette.get('accent')}; "
+            f"hex {', '.join(palette.get('hex_codes', []))}"
+        )
+
+    vastu_line = f"VASTU: {brief.vastu_compliance}"
+    if str(brief.vastu_compliance).lower() == "strict":
+        vastu_line += " - every strong rule is mandatory and is checked by code"
+
+    kitchen_line = ""
+    if brief.room_type == "kitchen" and str(brief.vastu_compliance).lower() == "strict":
+        kitchen_line = (
+            "KITCHEN VASTU (mandatory): place the cooking platform on the "
+            "SOUTH-EAST wall, facing EAST."
+        )
+
+    structured_brief = json.dumps(
+        request.brief_object(), ensure_ascii=False, sort_keys=True
+    )
+    return f"""AUTHORITATIVE STRUCTURED FORM BRIEF (JSON):
+{structured_brief}
+
+ROOM TYPE: {brief.room_type.replace('_', ' ').title()}
+STYLE: {brief.style.replace('_', ' ')}
+COLOUR SCHEME: {brief.form_color_scheme or brief.color_scheme or 'not specified'}
+{palette_line}
 BUDGET TIER: {request.budget.value.upper()} (approximately Rs {budget_amount:,} total, inclusive of furniture and decor)
-DIMENSIONS: {request.room_dimensions or 'not specified - assume a standard Indian apartment room'}
+DIMENSIONS: {dims}
+DOOR DIRECTION: {brief.door_direction or 'not supplied'}
+WINDOW DIRECTION: {brief.window_direction or 'not supplied'}
 CLIENT BRIEF: {request.client_preferences}
 FURNITURE REQUESTED: {', '.join(request.furniture) if request.furniture else 'choose appropriate furniture'}
-SPECIAL REQUIREMENTS: {', '.join(request.specific_requirements) if request.specific_requirements else 'none'}
-OCCUPANTS: {', '.join(request.occupants) if request.occupants else 'not specified'}
-VASTU: {request.vastu_compliance.value}
-LIFESTYLE NOTES: {request.lifestyle_notes or 'none'}"""
+SPECIAL REQUIREMENTS: {', '.join(brief.special_requirements) if brief.special_requirements else 'none'}
+OCCUPANTS: {', '.join(brief.occupants) if brief.occupants else 'not specified'}
+{vastu_line}
+{kitchen_line}
+LIFESTYLE NOTES: {brief.lifestyle_notes or 'none'}"""
+
+
+_VASTU_COMPLIANCE_CLAIM = re.compile(
+    r"\b(?:fully\s+|strictly\s+)?vastu[\s-]*(?:compliant|compliance|friendly)\b"
+    r"|\b(?:respects?\s+vastu|as\s+per\s+vastu|according\s+to\s+vastu|"
+    r"(?:to\s+)?comply\s+with\s+vastu(?:\s+principles?)?|"
+    r"complies?\s+with\s+vastu(?:\s+principles?)?|"
+    r"align(?:s|ed|ing)?\s+with\s+vastu(?:\s+principles?)?|"
+    r"in\s+accordance\s+with\s+vastu(?:\s+principles?)?)\b",
+    re.I,
+)
+
+
+def _remove_vastu_compliance_claim(text: str) -> str:
+    """Keep compliance claims in generated prose out of the client output."""
+    if not _VASTU_COMPLIANCE_CLAIM.search(text):
+        return text
+    cleaned = _VASTU_COMPLIANCE_CLAIM.sub("", text)
+    cleaned = re.sub(r"(?i)\bprinciples\b(?=\s*[,.;]|$)", "", cleaned)
+    cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
+    cleaned = re.sub(r",\s*(?:,|$)", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+(that|which)\s*$", "", cleaned, flags=re.I)
+    return cleaned.strip(" ,.;")
 
 
 def _catalog_block(brief: BriefConstraints) -> str:
@@ -153,71 +244,56 @@ def _catalog_block(brief: BriefConstraints) -> str:
     room keeps the prompt tight on larger catalogs.
     """
     from app.catalog import catalog
+    from app.engine.occupants import product_is_allowed
 
-    rows = catalog.all()
-    if brief.room_type:
-        from app.engine.brief import ROOM_CATEGORIES
+    # Only products that belong in this room. The old filter showed the whole
+    # catalog and then kept "12 others" as padding, which is how a kitchen
+    # brief got a kids' study table, a bean bag and a sofa to choose from.
+    rows = catalog.for_room(brief.room_type) if brief.room_type else catalog.all()
 
-        preferred = set(ROOM_CATEGORIES.get(brief.room_type, ()))
-        if preferred:
-            on_topic = [i for i in rows if i.category in preferred]
-            # Always keep a few cross-category picks (decor, lighting) so the
-            # design is not artificially limited to furniture.
-            others = [i for i in rows if i.category not in preferred]
-            rows = on_topic + others[:12]
+    # Do not *show* the model products the brief forbids. Filtering only on the
+    # way out meant an adults-only room still listed a Kids Study Table and a
+    # Kids Cot in the prompt, and a 2B model will cheerfully pick from a list it
+    # was given. Prevention is the fix; the validator check is the safety net.
+    audience = getattr(brief, "audience", "any")
+    if audience != "any":
+        allowed = [i for i in rows if product_is_allowed(i, audience)]
+        if allowed:
+            rows = allowed
+
+    # One row per product. A duplicate SKU in the prompt is what produced a
+    # shopping list with "Kids Chair - Ergonomic" twice.
+    seen: set = set()
+    unique = []
+    for item in rows:
+        if item.sku in seen:
+            continue
+        seen.add(item.sku)
+        unique.append(item)
+    rows = unique
 
     lines = [
-        f"{'SKU':<22} {'NAME':<44} {'CAT':<10} {'Rs':>7} {'W x D x H (cm)':<18} TIER"
+        f"{'SKU':<22} {'NAME':<44} {'CAT':<10} {'BRAND':<16} {'Rs':>7} {'W x D x H (cm)':<18} TIER"
     ]
     for item in rows:
         dims = f"{item.width_cm} x {item.depth_cm} x {item.height_cm}"
         lines.append(
             f"{item.sku:<22} {item.name[:44]:<44} {item.category:<10} "
-            f"{item.price_inr:>7,} {dims:<18} {item.tier}"
+            f"{item.brand[:16]:<16} {item.price_inr:>7,} {dims:<18} {item.tier}"
         )
     return "\n".join(lines)
 
 
 def _fallback_palette(scheme: Optional[str]) -> Dict[str, Any]:
-    """
-    A palette for the fallback path, chosen to satisfy the brief's scheme.
+    """The palette for a scheme, from the one scheme table.
 
-    Must pass the same colour check as an LLM-written palette, so a fallback
-    for a "vibrant" brief actually is vibrant. Values are chosen for HSV
-    saturation well above the 0.35 threshold the validator enforces.
+    There used to be two tables - one here for the fallback and one in the
+    validator - and they disagreed for "Warm Earthy". There is now one, in
+    `app.engine.palette`, used by the fallback, the install step and the check.
     """
-    presets: Dict[str, Dict[str, Any]] = {
-        "vibrant": {
-            "primary": "coral", "secondary": "teal", "accent": "marigold",
-            "neutrals": ["white", "pale grey"],
-            "hex_codes": ["#FF6B5B", "#17A2A2", "#F2A93B"],
-        },
-        "cool": {
-            "primary": "teal", "secondary": "navy", "accent": "sky blue",
-            "neutrals": ["white", "light grey"],
-            "hex_codes": ["#17A2A2", "#1E3A5F", "#4A9FD8"],
-        },
-        "earthy": {
-            "primary": "terracotta", "secondary": "olive", "accent": "rust",
-            "neutrals": ["sand", "off white"],
-            "hex_codes": ["#C0704A", "#7A8B4F", "#A63D2F"],
-        },
-        "pastel": {
-            "primary": "pale pink", "secondary": "powder blue", "accent": "mint",
-            "neutrals": ["white"],
-            "hex_codes": ["#F7C6D0", "#BBD7EE", "#BFEAD9"],
-        },
-        "monochrome": {
-            "primary": "charcoal", "secondary": "grey", "accent": "silver",
-            "neutrals": ["white", "black"],
-            "hex_codes": ["#2E2E2E", "#7A7A7A", "#C9C9C9"],
-        },
-    }
-    return presets.get((scheme or "neutral").lower(), {
-        "primary": "warm white", "secondary": "greige", "accent": "sage",
-        "neutrals": ["white", "soft grey"],
-        "hex_codes": ["#F2EFE9", "#CFC7BA", "#9CAF88"],
-    })
+    from app.engine.palette import palette_for
+
+    return palette_for(scheme)
 
 
 # ==========================================================================
@@ -276,13 +352,18 @@ Respond ONLY with valid JSON:
   "risks": ["potential design or budget risk to watch", ...]
 }"""
 
-    async def run(self, request: DesignRequest, contexts: List[RetrievedContext]) -> Tuple[Dict[str, Any], AgentStep]:
+    async def run(
+        self,
+        request: DesignRequest,
+        contexts: List[RetrievedContext],
+        brief: Optional[BriefConstraints] = None,
+    ) -> Tuple[Dict[str, Any], AgentStep]:
         start = time.perf_counter()
         context_block = retrieval_service.format_context(contexts)
 
         prompt = f"""Create a design plan for this room.
 
-{_brief_to_text(request)}
+{_brief_to_text(request, brief)}
 
 RELEVANT DESIGN KNOWLEDGE (use these facts, cite them where relevant):
 {context_block or 'No external knowledge retrieved - rely on your expertise.'}
@@ -353,7 +434,7 @@ Respond ONLY with valid JSON:
   "lighting_plan": "layered lighting description with temperatures and wattage",
   "storage_strategy": "storage plan with quantities",
   "decor_suggestions": ["...", ...],
-  "vastu_notes": ["...", ...],
+  "trade_offs": ["honest limitation of this design", ...],
   "brands": ["brand name", ...],
   "pros": ["...", ...],
   "cons": ["honest trade-offs", ...]
@@ -362,7 +443,13 @@ Respond ONLY with valid JSON:
 HARD REQUIREMENTS - violating any of these makes the design invalid:
 - Every furniture entry has a `sku` that appears verbatim in the catalog.
 - The number of items matches what the client asked for, including quantities.
-- If the client asked for a specific colour scheme, the palette matches it."""
+- The palette is FIXED by the selected colour scheme. Use exactly the colours
+  and hex codes given under PALETTE. Never use a colour the scheme forbids.
+- Use only products from the catalog list, and only brands printed in it.
+- Do not write Vastu notes. Vastu notes are generated from the rule-check
+  results by code; any compliance claim you write is discarded and checked.
+- Every special requirement the client ticked must be addressed explicitly in
+  the layout, storage or lighting text and by at least one catalog item."""
 
     async def run(
         self,
@@ -380,7 +467,7 @@ HARD REQUIREMENTS - violating any of these makes the design invalid:
             room_type=request.room_type.value,
             color_scheme=request.color_scheme,
             budget_inr=request.budget_amount_inr,
-            room_dimensions=request.room_dimensions or "",
+            room_dimensions=request.dimension_text(),
         )
 
         revision_block = ""
@@ -422,7 +509,7 @@ responding."""
 
         prompt = f"""Design this room.
 
-{_brief_to_text(request)}
+{_brief_to_text(request, brief)}
 
 DESIGN PLAN (agreed, follow it):
 {json.dumps(plan, indent=2)}
@@ -452,7 +539,16 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
                 proposal, problems = validate_selection(raw)
                 if proposal is not None:
                     design = raw
-                    design["furniture"] = selections_to_furniture(proposal)
+                    # De-duplicate before the design sees its own list: the
+                    # model sometimes names the same SKU twice, and downstream
+                    # that became a shopping list with a repeated row.
+                    merged: Dict[str, int] = {}
+                    for sel in proposal.furniture:
+                        merged[sel.sku] = max(merged.get(sel.sku, 0), sel.quantity)
+                    design["furniture"] = [
+                        {**item, "quantity": merged[item["sku"]]}
+                        for item in selections_to_furniture(proposal)
+                    ]
                     if proposal.color_palette is not None:
                         design["color_palette"] = proposal.color_palette.model_dump()
                     # Prose strings are also trimmed to their validated lengths.
@@ -469,6 +565,31 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
 
             if not design.get("title"):
                 design = self._fallback_design(request, plan, brief)
+
+            # The palette is a specification of the selected scheme, so it is
+            # installed in code. The model's palette is only used to fill gaps
+            # for a scheme the palette table does not know.
+            from app.engine.palette import palette_for
+
+            if brief.palette:
+                design["color_palette"] = {
+                    k: v for k, v in brief.palette.items()
+                    if k in ("primary", "secondary", "accent", "neutrals",
+                             "hex_codes", "label", "scheme")
+                }
+            elif not isinstance(design.get("color_palette"), dict):
+                design["color_palette"] = palette_for(brief.color_scheme)
+
+            # Vastu notes are not the model's to write: they are generated from
+            # the rule-check results, so a "respects Vastu" sentence cannot
+            # sit next to a failed south-east rule.
+            design.pop("vastu_notes", None)
+            # Trade-offs are kept separately from Vastu from here on.
+            trade_offs = design.get("trade_offs")
+            if not isinstance(trade_offs, list):
+                trade_offs = list(design.get("cons") or [])
+            design["trade_offs"] = [str(t) for t in trade_offs if str(t).strip()][:8]
+
             design["revision_round"] = revision
 
         duration = (time.perf_counter() - start) * 1000
@@ -508,7 +629,10 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             color_scheme=request.color_scheme,
             budget_inr=request.budget_amount_inr,
             vastu_compliance=request.vastu_compliance.value,
-            room_dimensions=request.room_dimensions or "",
+            room_dimensions=request.dimension_text(),
+            door_direction=request.door_direction,
+            window_direction=request.window_direction,
+            lifestyle_notes=request.lifestyle_notes,
         )
 
         # The fallback used to take `find_products(category)[0]` per required
@@ -530,6 +654,7 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             budget_inr=brief.budget_inr,
             optional=optional,
             style_tier=request.budget.value,
+            audience=brief.audience,
         )
         furniture: List[Dict[str, Any]] = [
             {
@@ -620,7 +745,6 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
                 "One large rug to anchor the seating or sleeping area",
                 "Curtains with a blackout lining if the window faces west",
             ],
-            "vastu_notes": [],
             "brands": sorted({f.get("brand", "") for f in furniture} - {""}),
             "pros": [
                 "Every item is a real catalog product with a verifiable price",
@@ -633,6 +757,14 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
                     "fallback path rather than written by the design agent",
                 ]
             ),
+            "trade_offs": (
+                [budget_note] if _budget_infeasible else
+                [
+                    "Overhead and tall units need wall space, which reduces "
+                    "decorative wall area",
+                    "Prose is generic because this design was assembled by code",
+                ]
+            ),
             # Carried through so the validator can distinguish "the model forgot
             # an item" from "the budget could not buy this item".
             "_budget_infeasible": _budget_infeasible,
@@ -642,28 +774,22 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
 
 class BudgetAgent(BaseAgent):
     """
-    Prices the design and validates that the total respects the budget tier.
+    Costing is no longer delegated to the model.
 
-    Also self-corrects: if the LLM's own arithmetic disagrees with the summed
-    line items, it recomputes. Small models are frequently sloppy here, and a
-    wrong total is the fastest way to lose a client's trust.
+    This agent used to ask the LLM to price a design and then "reconcile" the
+    answer. A model that emits zeros sums to zero, and the client saw a Rs 0
+    shopping list next to a Rs 24,900 headline. `price_design` now computes
+    every figure from the catalog, and the pipeline calls it directly. The
+    class is kept as a thin, model-free wrapper so existing call sites and
+    tests continue to work and so the step still appears in the pipeline UI.
     """
 
     name = "budget"
-    system_prompt = DESIGNER_SYSTEM_PROMPT + """
+    system_prompt = DESIGNER_SYSTEM_PROMPT
 
-Your job is COSTING. Price a design realistically for the Indian market.
-Be honest - if a design exceeds its budget tier, say so and propose reductions.
-Use realistic INR prices for Indian furniture retail.
-
-Respond ONLY with valid JSON:
-{
-  "estimated_cost_inr": 0,
-  "budget_breakdown": [{"category": "...", "amount_inr": 0, "percentage": 0, "notes": "..."}],
-  "within_budget": true,
-  "cost_drivers": ["the main things driving cost", ...],
-  "cost_savings": ["how to cut cost without hurting the design", ...]
-}"""
+    def cost(self, design: Dict[str, Any], budget_inr: Optional[int]) -> Dict[str, Any]:
+        """Price a design in code. The only costing path in the system."""
+        return price_design(design, budget_inr=budget_inr)
 
     async def run(
         self,
@@ -677,41 +803,8 @@ Respond ONLY with valid JSON:
             "high": 3_000_000, "luxury": 10_000_000,
         }.get(request.budget.value, 800_000)
 
-        furniture_summary = [
-            {
-                "item": f.get("name", "item"),
-                "price": f.get("estimated_price_inr", 0),
-                "qty": f.get("quantity", 1),
-            }
-            for f in design.get("furniture", [])
-            if isinstance(f, dict)
-        ]
-
-        prompt = f"""Price this design.
-
-{_brief_to_text(request)}
-
-DESIGN TO PRICE:
-Title: {_text(design.get('title'))}
-Layout: {_text(design.get('layout_description'), 800)}
-Furniture line items: {json.dumps(furniture_summary)}
-Lighting: {_text(design.get('lighting_plan'), 300)}
-Storage: {_text(design.get('storage_strategy'), 300)}
-
-STRICT BUDGET CEILING: Rs {budget_amount:,}
-
-Price every category. The sum of breakdown amounts must equal estimated_cost_inr.
-Flag clearly if this design cannot fit under the ceiling."""
-
         with tracer.start("agent.budget"):
-            try:
-                result = await self._call_llm(prompt, temperature=0.3)
-                costing = result["json"] if isinstance(result["json"], dict) else {}
-            except Exception as exc:
-                logger.warning("budget_failed error=%s", exc)
-                costing = {}
-
-        costing = self._reconcile(costing, design, request, budget_amount)
+            costing = self.cost(design, budget_amount)
 
         duration = (time.perf_counter() - start) * 1000
         metrics.observe("agent.budget.ms", duration)
@@ -868,21 +961,147 @@ Respond ONLY with valid JSON:
   "needs_revision": false
 }"""
 
+    @staticmethod
+    def _override_code_scores(
+        critique: Dict[str, Any],
+        costing: Dict[str, Any],
+        validation: Optional[Dict[str, Any]],
+        shopping_list: List[str],
+        vastu_notes: List[Any],
+    ) -> Dict[str, Any]:
+        """
+        Replace the model's own budget and brief-compliance scores with values
+        computed in Python.
+
+        The model was asked to rate "budget adherence" while looking at a JSON
+        costing blob, and it did so unreliably - a design Rs 21,100 over budget
+        could score 8/10. The arithmetic is not a matter of taste, so it is not
+        delegated: `within_budget` and the validator's pass rate are facts, and
+        they are now what the score reflects.
+
+        Also drops objections the critic raised about things that plainly exist,
+        since "no brands" or "no Vastu explanation" is a hallucinated defect and
+        sending the reflection loop to fix it wastes a round.
+        """
+        scores = critique.setdefault("scores", {})
+
+        # --- Budget: straight from the summed line items --------------------
+        total = float(costing.get("estimated_cost_inr", 0) or 0)
+        budget = costing.get("budget_inr")
+        if not costing.get("costing_complete", True):
+            scores["budget_adherence"] = 0.0
+        elif budget and total > float(budget):
+            over_ratio = (total - float(budget)) / max(float(budget), 1)
+            scores["budget_adherence"] = round(max(0.0, 5.0 - over_ratio * 5), 2)
+        elif budget:
+            headroom = 1.0 - (total / float(budget))
+            scores["budget_adherence"] = round(min(10.0, 7.0 + headroom * 3), 2)
+        else:
+            scores["budget_adherence"] = 7.0
+
+        # --- Brief compliance: the validator's pass rate --------------------
+        if validation:
+            checks_run = float(validation.get("checks_run", 0) or 0)
+            checks_passed = float(validation.get("checks_passed", 0) or 0)
+            pass_rate = (checks_passed / checks_run) if checks_run else 0.0
+            scores["brief_compliance"] = round(pass_rate * 10.0, 2)
+            if not validation.get("valid", True):
+                scores["feasibility"] = round(
+                    min(float(scores.get("feasibility", 0) or 0), pass_rate * 10.0),
+                    2,
+                )
+
+        # --- Strip objections that are factually wrong ----------------------
+        issues = [
+            str(i) for i in (critique.get("issues") or []) if str(i).strip()
+        ]
+        kept: List[str] = []
+        for issue in issues:
+            low = issue.lower()
+            if shopping_list and "no brand" in low and "brand" not in low.replace("no brand", ""):
+                continue
+            if shopping_list and ("without brand" in low or "no brands specified" in low):
+                continue
+            if shopping_list and any(
+                phrase in low for phrase in (
+                    "incomplete shopping list", "shopping list is incomplete",
+                    "missing items from the shopping list",
+                )
+            ):
+                # "Issues" reads as "issues addressed" in the UI, so listing
+                # an unresolved shopping list there was backwards. Those
+                # defects are reported on the validation line instead.
+                continue
+            if vastu_notes and "no vastu" in low:
+                continue
+            kept.append(issue)
+        critique["issues"] = kept
+
+        # Overall is recomputed so it cannot contradict the parts.
+        scored = [
+            float(v) for v in scores.values()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        if scored:
+            critique["overall"] = round(sum(scored) / len(scored), 2)
+        return critique
+
     async def run(
         self,
         request: DesignRequest,
         design: Dict[str, Any],
         costing: Dict[str, Any],
         plan: Dict[str, Any],
+        validation: Optional[Dict[str, Any]] = None,
+        brief: Optional[BriefConstraints] = None,
     ) -> Tuple[Dict[str, Any], AgentStep]:
         start = time.perf_counter()
 
+        # The critic is shown the *shopping list* and the Vastu notes as
+        # explicit context. Without them it graded designs it had not fully
+        # read and invented objections: it claimed "no brands specified" for a
+        # design with eight catalogued brands in front of it, and "no Vastu
+        # explanation" for one whose notes were in the payload. Naming the
+        # fields it must not claim are missing is cheaper than hoping it reads
+        # the whole JSON.
+        from app.catalog import catalog as _cat
+
+        # The shopping list is rendered from the code-computed costing, so the
+        # critic sees the price the client will see.
+        shopping_list = []
+        _priced = {
+            li["sku"]: li for li in (costing.get("line_items") or [])
+            if isinstance(li, dict) and li.get("sku")
+        }
+        for line in _priced.values():
+            shopping_list.append(
+                f"- {line.get('name')} x{line.get('quantity', 1)} "
+                f"({line.get('brand')}, SKU {line.get('sku')}, "
+                f"Rs {int(line.get('line_total_inr') or 0):,})"
+            )
+
+        # Brands are read from the catalog, not from the design: the model's
+        # suggestions may name a retailer that does not sell the product.
+        brands = sorted({
+            str(line.get("brand")) for line in _priced.values() if line.get("brand")
+        })
+        vastu_notes = design.get("vastu_notes") or []
+
         prompt = f"""Critique this design.
 
-{_brief_to_text(request)}
+{_brief_to_text(request, brief)}
 
 DESIGN PLAN:
 {json.dumps(plan, indent=2)[:1200]}
+
+SHOPPING LIST (every item below is a real catalog product with a real price):
+{chr(10).join(shopping_list) or '- (none)'}
+
+BRANDS ALREADY SPECIFIED ON THIS DESIGN ({len(brands)}):
+{', '.join(brands) or '- (none)'}
+
+VASTU NOTES ALREADY ON THIS DESIGN ({len(vastu_notes)}):
+{chr(10).join(str(n) for n in vastu_notes) or '- (none)'}
 
 PROPOSED DESIGN:
 {json.dumps(design, indent=2)[:3000]}
@@ -890,9 +1109,19 @@ PROPOSED DESIGN:
 COSTING:
 {json.dumps(costing, indent=2)[:1200]}
 
-Score it honestly on coherence, feasibility, budget adherence, aesthetics, and
-specificity. List the concrete problems that must be fixed. Set needs_revision to
-true if overall is below 7."""
+IMPORTANT - do not report a defect that does not exist:
+- If the shopping list above is populated, the design DOES specify brands.
+  Never claim "no brands specified".
+- If the Vastu notes above are non-empty, the design DOES explain Vastu.
+  Never claim "no Vastu explanation".
+- The costing figures are computed in Python from the catalog and are
+  authoritative. Do not dispute the arithmetic.
+
+Score it honestly on coherence, feasibility, aesthetics and specificity.
+Budget adherence and brief compliance are scored in code from the costing and
+the validator, so do not guess at them - score the rest.
+
+Set needs_revision to true if overall is below 7."""
 
         with tracer.start("agent.critic"):
             try:
@@ -903,6 +1132,13 @@ true if overall is below 7."""
                 critique = {}
 
         critique = self._sanitize(critique)
+        critique = self._override_code_scores(
+            critique, costing, validation, shopping_list, vastu_notes
+        )
+        # This field is the critic's *remaining* problems, not a list of what
+        # was fixed. Naming it otherwise is what made "Issues addressed" list
+        # an unresolved shopping list.
+        critique["remaining_issues"] = list(critique.get("issues") or [])
         duration = (time.perf_counter() - start) * 1000
         metrics.observe("agent.critic.ms", duration)
         metrics.observe("critic.overall_score", critique.get("overall", 0))
@@ -953,6 +1189,30 @@ true if overall is below 7."""
         }
 
 
+def catalog_category(item: Dict[str, Any]) -> str:
+    """The catalog category of a line item, from its SKU when possible."""
+    from app.catalog import catalog as _catalog
+
+    product = _catalog.get(str(item.get("sku", "")).strip())
+    return (product.category if product else str(item.get("category", ""))).lower()
+
+
+def is_cooking_product(item: Dict[str, Any]) -> bool:
+    """True for the product the cooking platform is mounted on.
+
+    A hob/hob-unit is the obvious one; a base unit is the counter run the hob
+    sits on. Anything else in the kitchen (a sink, a chimney) is not.
+    """
+    from app.catalog import catalog as _catalog
+
+    product = _catalog.get(str(item.get("sku", "")).strip())
+    name = (product.name if product else str(item.get("name", ""))).lower()
+    if any(word in name for word in ("sink", "chimney", "exhaust", "trolley",
+                                     "shelf", "cabinet", "pantry")):
+        return False
+    return any(word in name for word in ("base unit", "hob", "stove", "counter"))
+
+
 # ==========================================================================
 # Orchestrator
 # ==========================================================================
@@ -971,6 +1231,53 @@ class DesignPipeline:
         # Tracks which model actually served the most recent request so the
         # response reports reality rather than the configured default.
         self._last_model = settings.DEFAULT_MODEL
+        # Near-duplicate options rejected by the last request, surfaced to the
+        # client so a short list is explained rather than looking like a bug.
+        self._rejected_options: List[str] = []
+
+    @staticmethod
+    def _audience_violates(item: Dict[str, Any], audience: str) -> bool:
+        """Does this line item belong to a different audience than the brief?"""
+        from app.catalog import catalog
+        from app.engine.occupants import product_is_allowed
+
+        if audience == "any":
+            return False
+        product = catalog.get(str(item.get("sku", "")).strip())
+        return product is not None and not product_is_allowed(product, audience)
+
+    @staticmethod
+    def _repair_audience(item: Dict[str, Any], audience: str) -> None:
+        """
+        Swap a forbidden product for the closest allowed one in its category.
+
+        Leaves the item untouched when no acceptable substitute exists, so the
+        validator can still report it rather than the item being silently
+        dropped.
+        """
+        from app.catalog import catalog
+        from app.engine.brief import find_products
+        from app.engine.occupants import product_is_allowed
+
+        category = str(item.get("category", "")).strip()
+        candidates = [
+            p for p in find_products(category)
+            if product_is_allowed(p, audience)
+        ]
+        if not candidates:
+            return
+        replacement = min(candidates, key=lambda p: (p.price_inr, p.name))
+        logger.info(
+            "audience_replaced sku=%s -> %s audience=%s",
+            item.get("sku"), replacement.sku, audience,
+        )
+        item["sku"] = replacement.sku
+        item["name"] = replacement.name
+        item["category"] = replacement.category
+        item.setdefault("brand_suggestions", [replacement.brand])
+        item["width_cm"] = replacement.width_cm
+        item["depth_cm"] = replacement.depth_cm
+        item["height_cm"] = replacement.height_cm
 
     @staticmethod
     def catalog_has(sku: str) -> bool:
@@ -1075,6 +1382,28 @@ class DesignPipeline:
         is left exactly as-is.
         """
         budget = constraints.budget_inr
+        # 0. Drop products that belong to another kind of room, and merge a
+        # SKU the model listed twice. Both used to survive all the way to the
+        # client: a kitchen shopping list carried a kids' study table, a bean
+        # bag and a sofa, and a chair appeared twice. The prompt no longer
+        # shows these products, but a model can still emit one, and the
+        # constraint is a rule, not a hint.
+        from app.catalog import catalog
+
+        room = (constraints.room_type or "").lower()
+        filtered = []
+        for item in design.get("furniture", []) or []:
+            if not isinstance(item, dict):
+                continue
+            product = catalog.get(str(item.get("sku", "")).strip())
+            if product and not catalog.allowed_in_room(product, room):
+                filtered.append(f"{product.name} ({product.sku})")
+        if filtered:
+            design["_room_filter_violations"] = sorted(set(
+                (design.get("_room_filter_violations") or []) + filtered
+            ))
+        design["furniture"] = self._clean_furniture(design, constraints)
+
         # Repair invented SKUs before costing, so the repaired lines are picked
         # up by this pricing pass rather than needing a second one. Only an
         # item that *claims* a SKU and gets it wrong is repaired here; an item
@@ -1084,6 +1413,12 @@ class DesignPipeline:
         for item in design.get("furniture", []) or []:
             if not isinstance(item, dict):
                 continue
+            # Audience is a hard constraint, not a preference. A kids' product
+            # in an adults-only room is swapped for the adult equivalent here,
+            # rather than being left in place for the validator to complain about
+            # and the reflection loop to fail to fix.
+            if self._audience_violates(item, constraints.audience):
+                self._repair_audience(item, constraints.audience)
             claimed = str(item.get("sku", "")).strip()
             if claimed and not self.catalog_has(claimed):
                 self._repair_invented_sku(item)
@@ -1133,8 +1468,60 @@ class DesignPipeline:
         # that category and add it. This is the last step, after quantities
         # are settled, so a two-bed brief yields two beds by construction.
         self._insert_missing_required(design, constraints)
+        design["_normalized"] = True
 
         return design
+
+    @staticmethod
+    def _clean_furniture(
+        design: Dict[str, Any], constraints: BriefConstraints
+    ) -> List[Dict[str, Any]]:
+        """Remove out-of-room products and collapse duplicate SKUs.
+
+        Kept public so tests and other callers normalise furniture exactly the
+        way the pipeline does.
+        """
+        from app.catalog import catalog
+
+        raw = design.get("furniture")
+        if not isinstance(raw, list):
+            return []
+        room = (constraints.room_type or "").lower()
+        merged: Dict[str, Dict[str, Any]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            sku = str(item.get("sku", "")).strip().upper()
+            product = catalog.get(sku) if sku else None
+            if product is not None:
+                if not catalog.allowed_in_room(product, room):
+                    logger.info(
+                        "wrong_room_item_dropped sku=%s room=%s", sku, room
+                    )
+                    metrics.increment("design.dropped_wrong_room_item")
+                    continue
+                # One line per product. The quantity is the largest asked for,
+                # not the sum - the duplicate was the same request emitted
+                # twice, not two separate requests.
+                try:
+                    qty = int(float(item.get("quantity", 1) or 1))
+                except (TypeError, ValueError):
+                    qty = 1
+                existing = merged.get(sku)
+                if existing is not None:
+                    metrics.increment("design.duplicate_item_merged")
+                    existing["quantity"] = max(
+                        int(existing.get("quantity", 1) or 1), max(1, qty)
+                    )
+                    continue
+                item = {**item, "quantity": max(1, qty)}
+                merged[sku] = item
+            else:
+                # Uncatalogued entries are left in place: the validator reports
+                # them, and guessing a product here would invent a line.
+                key = f"__raw__{len(merged)}"
+                merged[key] = item
+        return list(merged.values())
 
     @staticmethod
     def _insert_missing_required(
@@ -1197,6 +1584,87 @@ class DesignPipeline:
             metrics.increment("design.inserted_required_item")
 
     @staticmethod
+    def _attach_vastu(design: Dict[str, Any], brief: BriefConstraints) -> None:
+        """Run the rule check and replace the model's Vastu notes with it.
+
+        The notes the client reads are the rule results, so the section cannot
+        contain a trade-off sentence, and "respects Vastu" cannot appear next
+        to a failed rule.
+
+        Under Strict, the cooking platform is forced to the south-east, facing
+        east. That is a specification, not a creative choice: the model choosing
+        the south wall gets its counter moved by code rather than the design
+        being blocked on a rule the model cannot reliably satisfy.
+        """
+        from app.engine.vastu import analyse_design
+
+        if brief.room_type == "kitchen":
+            platform = next(
+                (
+                    item for item in design.get("furniture", [])
+                    if isinstance(item, dict)
+                    and catalog_category(item) == "kitchen"
+                    and is_cooking_product(item)
+                ),
+                None,
+            )
+            if platform is None:
+                # Nothing for the cooking rule to act on in the list itself;
+                # the base unit is the counter the platform belongs to.
+                platform = next(
+                    (
+                        item for item in design.get("furniture", [])
+                        if isinstance(item, dict)
+                        and str(item.get("sku", "")).upper().startswith("KIT-")
+                    ),
+                    None,
+                )
+            wall = str(
+                (platform or {}).get("wall")
+                or (platform or {}).get("placement_wall")
+                or ""
+            ).lower() or None
+            strict = str(brief.vastu_compliance).lower() == "strict"
+            status = {
+                "name": (platform or {}).get("name", "Cooking platform"),
+                "sku": (platform or {}).get("sku"),
+                "wall": wall,
+                "facing": (platform or {}).get("facing"),
+                "source": "model" if wall else "unspecified",
+            }
+            # Strict Vastu is a hard requirement: the platform is placed on the
+            # south-east wall facing east, and the rule check verifies it.
+            if strict:
+                status.update({
+                    "wall": "southeast",
+                    "facing": "east",
+                    "source": "forced_by_strict_vastu",
+                })
+                if platform is not None:
+                    platform["wall"] = "southeast"
+                    platform["facing"] = "east"
+                    platform["placement_wall"] = "southeast"
+            design["cooking_platform"] = status
+
+        report = analyse_design(design, brief)
+        design["_vastu"] = report.to_dict()
+        design["vastu_notes"] = list(report.notes)
+        design["vastu_score"] = report.score
+        # Compliance is stated only by the rule results. Strip model-authored
+        # claims even when they happen to agree with this assessment.
+        for key in ("concept", "layout_description", "lighting_plan", "storage_strategy"):
+            value = design.get(key)
+            if isinstance(value, str):
+                design[key] = _remove_vastu_compliance_claim(value)
+        for key in ("zones", "decor_suggestions", "pros", "cons", "trade_offs"):
+            value = design.get(key)
+            if isinstance(value, list):
+                design[key] = [
+                    _remove_vastu_compliance_claim(item) if isinstance(item, str) else item
+                    for item in value
+                ]
+
+    @staticmethod
     def _parse_constraints(request: DesignRequest) -> BriefConstraints:
         """
         Turn the API request into a checkable constraint set.
@@ -1205,17 +1673,21 @@ class DesignPipeline:
         the deterministic checks. Everything the validator needs is derived
         here, once, in code.
         """
+        form = request.brief_object()
         return parse_brief(
-            client_preferences=request.client_preferences,
-            furniture=request.furniture,
-            specific_requirements=request.specific_requirements,
-            occupants=request.occupants,
-            room_type=request.room_type.value,
-            style=request.style.value,
-            color_scheme=request.color_scheme,
-            budget_inr=request.budget_amount_inr,
-            vastu_compliance=request.vastu_compliance.value,
-            room_dimensions=request.room_dimensions or "",
+            client_preferences=form["client_brief"],
+            furniture=form["furniture"],
+            specific_requirements=form["special_requirements"],
+            occupants=form["occupants"],
+            room_type=form["room_type"],
+            style=form["style"],
+            color_scheme=form["color_scheme"],
+            budget_inr=form["budget_inr"],
+            vastu_compliance=form["vastu_level"],
+            room_dimensions=form["dimensions_text"],
+            door_direction=form["door_direction"],
+            window_direction=form["window_direction"],
+            lifestyle_notes=form["lifestyle_notes"],
         )
 
     async def generate(
@@ -1263,7 +1735,7 @@ class DesignPipeline:
 
         with tracer.start("pipeline.run", request_id=request_id):
             constraints = self._parse_constraints(request)
-            plan, step = await self.planner.run(request, contexts)
+            plan, step = await self.planner.run(request, contexts, brief=constraints)
             yield {"type": "step", "data": step.model_dump()}
 
             # ---- reflection loop ----
@@ -1273,16 +1745,19 @@ class DesignPipeline:
             # could score well enough to be accepted. Now a deterministic
             # validation failure forces a rewrite regardless of what the
             # critic said, which is what makes the guarantee hold.
+            #
+            # Every attempt is retained and the best one is returned. The
+            # observed failure was the opposite: revision 1 scored 7.4, then
+            # revision 2 dropped to 5.8 and went over budget, and the last one
+            # - the worst - was what the client received.
+            attempts: List[Dict[str, Any]] = []
             best: Optional[Dict[str, Any]] = None
             best_critique: Dict[str, Any] = {}
             best_score = -1.0
             last_report = None
+            previous_score = -1.0
 
             for revision in range(settings.MAX_REFLECTION_ROUNDS + 1):
-                # Tracks convergence across rounds so a flat result can end the
-                # loop early instead of spending the full budget on no change.
-                previous_score = -1.0
-                stalled_rounds = 0
                 if revision > 0:
                     yield {
                         "type": "step",
@@ -1307,6 +1782,11 @@ class DesignPipeline:
                 # number and never gets to state one.
                 costing = price_design(design, budget_inr=constraints.budget_inr)
 
+                # The Vastu assessment is attached before validation, because
+                # the validator blocks a Strict design whose cooking rule
+                # fails and a design that claims compliance it does not have.
+                self._attach_vastu(design, constraints)
+
                 report = validate_design(design, constraints, costing)
                 yield {
                     "type": "step",
@@ -1324,7 +1804,10 @@ class DesignPipeline:
                     ).model_dump(),
                 }
 
-                critique, step = await self.critic.run(request, design, costing, plan)
+                critique, step = await self.critic.run(
+                    request, design, costing, plan, validation=report.to_dict(),
+                    brief=constraints,
+                )
                 # Fold the code verdict into the critique so the UI shows one
                 # coherent evaluation, and so the loop keeps the attempt that
                 # actually satisfies the brief rather than the one the model
@@ -1339,6 +1822,15 @@ class DesignPipeline:
                     critique.get("overall", 0)
                 )
 
+                attempts.append({
+                    "revision": revision,
+                    "score": round(score, 2),
+                    "critic_overall": round(float(critique.get("overall", 0) or 0), 2),
+                    "valid": report.is_valid,
+                    "blocking_issues": [v.code for v in report.errors],
+                    "total_cost_inr": int(costing.get("estimated_cost_inr") or 0),
+                })
+
                 if score > best_score:
                     best_score = score
                     best_critique = critique
@@ -1350,40 +1842,38 @@ class DesignPipeline:
                     # discarded draft.
                     last_report = report
 
-                needs_revision = not report.is_valid or bool(
-                    critique.get("needs_revision")
-                )
-                if not needs_revision or revision >= settings.MAX_REFLECTION_ROUNDS:
+                # Stop as soon as nothing blocking remains. A clean design is
+                # finished; asking for another round on the strength of a
+                # soft critic preference is what produced revision 2, which
+                # scored worse and went over budget.
+                if report.is_valid:
+                    break
+                if revision >= settings.MAX_REFLECTION_ROUNDS:
                     break
 
-                # Early stop on a flat score. The loop exists to improve the
-                # design; when a revision scores no better than the attempt it
-                # replaced, the model is not converging and another round burns
-                # 60-90s of local inference to return the same thing. This was
-                # the observed behaviour: two full rounds, no change, and the
-                # user waited the whole time for a worse-or-equal result.
+                # A flat score means the model is not converging. Re-running
+                # it changes nothing except latency, and the observed case was
+                # worse: a clean-enough revision 1 at 7.4 was followed by a
+                # revision 2 at 5.8 that went over budget. The best attempt is
+                # already kept, so stop and return it.
                 if revision >= 1 and score <= previous_score:
-                    stalled_rounds += 1
-                    if stalled_rounds >= STALL_LIMIT:
-                        yield {
-                            "type": "step",
-                            "data": AgentStep(
-                                agent="pipeline",
-                                status="info",
-                                message=(
-                                    "Stopping early: the last revision did not improve "
-                                    "on the previous one."
-                                ),
-                                data={
-                                    "stalled": True,
-                                    "last_score": round(score, 2),
-                                    "previous_score": round(previous_score, 2),
-                                },
-                            ).model_dump(),
-                        }
-                        break
-                else:
-                    stalled_rounds = 0
+                    yield {
+                        "type": "step",
+                        "data": AgentStep(
+                            agent="pipeline",
+                            status="info",
+                            message=(
+                                "Stopping early: the last revision did not improve; "
+                                "returning the best attempt so far."
+                            ),
+                            data={
+                                "stalled": True,
+                                "score": round(score, 2),
+                                "previous_score": round(previous_score, 2),
+                            },
+                        ).model_dump(),
+                    }
+                    break
                 previous_score = score
 
             if best is None:
@@ -1400,40 +1890,68 @@ class DesignPipeline:
                 request, plan, contexts, constraints, seed_design=best
             )
 
-            # Report the cheapest option's cost, and make the published total
-            # reconcile with the options on screen.
-            option_total = min(
-                (o.estimated_cost_inr for o in options), default=0
+        # Self-consistency audit. The client sees several views of the same
+        # design - colour chips, swatch labels, the shopping list, the prose -
+        # and they were able to disagree. Anything reported here is a defect
+        # between two parts of one response, so it is checked in code rather
+        # than asked of the model.
+        from app.engine.consistency import audit_option
+
+        has_bearings = bool(
+            constraints.door_direction and constraints.window_direction
+        )
+        strict = str(constraints.vastu_compliance).lower() == "strict"
+        requested = list(constraints.required_items.keys())
+        option_audits: List[Dict[str, Any]] = []
+        for option in options:
+            audit = audit_option(
+                option.model_dump(),
+                requested=requested,
+                strict_vastu=strict,
+                has_bearings=has_bearings,
             )
-            reported_total = option_total or final_cost["estimated_cost_inr"]
-
-            # The phased plan must be built from the option the user is
-            # actually shown. Building it from the reflection-loop design
-            # produced a plan whose total contradicted the rendered option -
-            # the same class of bug as a total that does not match its lines.
-            presented = options[0] if options else None
-            if presented is not None and constraints.budget_inr:
-                presented_cost = price_design(
-                    {"furniture": [
-                        {"sku": f.sku, "category": f.category,
-                         "quantity": f.quantity, "name": f.name}
-                        for f in presented.furniture if f.sku
-                    ]},
-                    budget_inr=constraints.budget_inr,
-                )
-                budget_plan = (
-                    build_phased_plan(presented_cost["line_items"], constraints.budget_inr)
-                    if not presented_cost["within_budget"]
-                    else None
-                )
-            else:
-                budget_plan = (
-                    build_phased_plan(final_cost["line_items"], constraints.budget_inr)
-                    if constraints.budget_inr and not final_cost["within_budget"]
-                    else None
+            option_audits.append(audit)
+            if audit["problems"]:
+                logger.info(
+                    "option_consistency_issues title=%s codes=%s",
+                    option.title,
+                    [p["code"] for p in audit["problems"]],
                 )
 
-            response = DesignResponse(
+        # One total, reconciled. `option.estimated_cost_inr` and its shopping
+        # list are both produced by `price_design`, so the total is literally
+        # the sum of the rows the client can see.
+        reported_total = min(
+            (o.estimated_cost_inr for o in options), default=0
+        ) or final_cost["estimated_cost_inr"]
+
+        # The phased plan must be built from the option the user is actually
+        # shown. Building it from the reflection-loop design produced a plan
+        # whose total contradicted the rendered option - the same class of bug
+        # as a total that does not match its lines.
+        presented = options[0] if options else None
+        if presented is not None and constraints.budget_inr:
+            presented_cost = price_design(
+                {"furniture": [
+                    {"sku": f.sku, "category": f.category,
+                     "quantity": f.quantity, "name": f.name}
+                    for f in presented.furniture if f.sku
+                ]},
+                budget_inr=constraints.budget_inr,
+            )
+            budget_plan = (
+                build_phased_plan(presented_cost["line_items"], constraints.budget_inr)
+                if not presented_cost["within_budget"]
+                else None
+            )
+        else:
+            budget_plan = (
+                build_phased_plan(final_cost["line_items"], constraints.budget_inr)
+                if constraints.budget_inr and not final_cost["within_budget"]
+                else None
+            )
+
+        response = DesignResponse(
                 request_id=request_id,
                 options=options,
                 context_sources=contexts,
@@ -1450,6 +1968,22 @@ class DesignPipeline:
                 budget_plan=budget_plan,
                 brief_constraints=constraints.to_dict(),
                 partial=bool(last_report and not last_report.is_valid),
+                # Everything the design had to assume, and whether Vastu can
+                # be claimed at all. Attached to the response rather than buried
+                # in the validator output so the client sees it up front.
+                assumptions=assess_assumptions(
+                    best or {},
+                    constraints,
+                    strict_vastu=(
+                        str(constraints.vastu_compliance).lower() == "strict"
+                    ),
+                ),
+                rejected_options=list(getattr(self, "_rejected_options", [])),
+                # Per-option self-consistency findings (B5, C3, D3, D4).
+                consistency=option_audits,
+                # Every attempt the reflection loop produced, so the choice of
+                # the returned one is auditable rather than implicit.
+                revisions=attempts,
             )
 
         metrics.observe("pipeline.latency_ms", response.latency_ms)
@@ -1510,7 +2044,73 @@ class DesignPipeline:
             return_exceptions=True,
         )
         options.extend(r for r in results if isinstance(r, DesignOption))
-        return options[: request.num_options]
+
+        # Near-duplicates are dropped here rather than served. Asking a 2B model
+        # for "a distinctly different approach" reliably produced the same room
+        # with the title swapped, so three "options" were one option shown
+        # three times. Anything too close to an earlier option is rejected and
+        # reported, rather than padding the count with a copy.
+        #
+        # Dedup works on plain dicts (that is all a fingerprint needs), so each
+        # surviving dict is matched back to its DesignOption. Returning the
+        # dicts instead is what broke the pipeline downstream: every later
+        # step expects a validated option object.
+        distinct, rejected = select_distinct(
+            [o.model_dump() for o in options]
+        )
+        if rejected:
+            logger.info(
+                "options_deduplicated kept=%d rejected=%d reasons=%s",
+                len(distinct), len(rejected),
+                "; ".join(describe_rejection(r) for r in rejected[:3]),
+            )
+            # Carry the explanation through so the client is told why fewer
+            # options appeared than were requested, instead of wondering.
+            self._rejected_options = [
+                describe_rejection(r) for r in rejected
+            ]
+        else:
+            self._rejected_options = []
+
+        # Rebuild the surviving DesignOption objects, in their original order,
+        # and only rename where a title genuinely collides.
+        # Dedup works on plain dicts (that is all a fingerprint needs), so each
+        # surviving dict is matched back to its DesignOption.
+        final: List[DesignOption] = []
+        title_counts: Dict[str, int] = {}
+        for option in options:
+            dumped = option.model_dump()
+            # Match on identity of the dumped payload rather than content, so
+            # two options with identical titles cannot select each other.
+            if not any(dumped == d for d in distinct):
+                continue
+            base = str(option.title or "Design Option").strip()
+            title_counts[base] = title_counts.get(base, 0) + 1
+            if title_counts[base] > 1:
+                option.title = f"{base} (variant {title_counts[base]})"
+            final.append(option)
+
+        return (final or options)[: request.num_options]
+
+    @staticmethod
+    def _ensure_distinct_titles(options: List[Dict[str, Any]]) -> None:
+        """
+        Make sure no two surviving options share a title.
+
+        Two identically-named cards are indistinguishable in the UI, and the
+        client cannot tell which one they are looking at. The suffix is added
+        only where there is an actual collision - renumbering every option
+        unconditionally is noise.
+        """
+        seen: Dict[str, int] = {}
+        for option in options:
+            title = str(option.get("title") or "Design Option").strip()
+            if title not in seen:
+                seen[title] = 1
+                option["title"] = title
+                continue
+            seen[title] += 1
+            option["title"] = f"{title} (variant {seen[title]})"
 
     def _to_option(
         self,
@@ -1532,10 +2132,23 @@ class DesignPipeline:
         # version repaired quantities after pricing, which let a bunk bed
         # reach the client showing quantity 2 at a unit price for one - a real
         # arithmetic error, not a display one.
-        design = self._normalize_design(design, constraints)
+        #
+        # A design that came through the pipeline is already normalised.
+        # Running the repair again re-inserted required items onto the option
+        # (served was counted from an unnormalised copy), which made the
+        # option's shopping list grow between validation and display.
+        if not design.get("_normalized"):
+            design = self._normalize_design(design, constraints)
 
         costed = price_design(design, budget_inr=budget)
         priced_by_sku = {li["sku"]: li for li in costed["line_items"]}
+
+        # Compute this option's own geometry, Vastu verdict and brief check.
+        # The response-level validation describes the design that won the
+        # reflection loop; the option card must describe the option on it.
+        layout = self._layout_for(design, costed, constraints)
+        self._attach_vastu(design, constraints)
+        report = validate_design(design, constraints, costed)
         for item in design.get("furniture", []) or []:
             if not isinstance(item, dict):
                 continue
@@ -1577,31 +2190,50 @@ class DesignPipeline:
                     out.append(str(v))
             return out
 
+        # One row per piece of furniture, one price source. There is exactly
+        # one entry in `design["furniture"]` per catalog product (pricing and
+        # the repair paths de-duplicate by SKU), and its price, brand and
+        # dimensions are read from the code-computed costing. That was the
+        # Rs 0 bug: rows came from model-authored fields while the total came
+        # from the catalog, so a row could read zero next to a real total.
+        # An item the catalog cannot price still appears, at Rs 0, so the
+        # validator can report it instead of it vanishing from the list.
         furniture = []
+        shopping_list = []
         for item in design.get("furniture", []) or []:
             if not isinstance(item, dict):
                 continue
+            sku = str(item.get("sku", "")).strip()
+            line = priced_by_sku.get(sku) or {}
             try:
-                qty = int(float(item.get("quantity", 1) or 1))
+                qty = max(1, int(float(item.get("quantity", 1) or 1)))
             except (TypeError, ValueError):
                 qty = 1
-            # Price comes from the code-computed costing where available, so
-            # the option shows the same number the validation used.
-            line = (item.get("_priced") or {})
+            unit = int(line.get("unit_price_inr") or 0)
             furniture.append(FurnitureItem(
-                name=str(item.get("name", "Item")),
-                category=str(item.get("category", "")),
-                brand_suggestions=safe_list(item.get("brand_suggestions"))[:4],
-                estimated_price_inr=int(line.get("unit_price_inr", 0) or 0),
-                quantity=max(1, qty),
-                sku=item.get("sku") or line.get("sku"),
-                unit_price_inr=int(line.get("unit_price_inr", 0) or 0),
-                line_total_inr=int(line.get("line_total_inr", 0) or 0),
-                url=item.get("url") or line.get("url"),
-                width_cm=int(line.get("dimensions_cm", {}).get("width", 0) or 0),
-                depth_cm=int(line.get("dimensions_cm", {}).get("depth", 0) or 0),
-                height_cm=int(line.get("dimensions_cm", {}).get("height", 0) or 0),
+                name=str(line.get("name") or item.get("name") or "Item"),
+                category=str(line.get("category") or item.get("category") or ""),
+                # The catalog's brand, never a model suggestion.
+                brand_suggestions=[line["brand"]] if line.get("brand") else [],
+                estimated_price_inr=unit,
+                quantity=qty,
+                sku=line.get("sku") or (sku or None),
+                unit_price_inr=unit,
+                line_total_inr=unit * qty,
+                url=line.get("url"),
+                width_cm=int((line.get("dimensions_cm") or {}).get("width") or 0),
+                depth_cm=int((line.get("dimensions_cm") or {}).get("depth") or 0),
+                height_cm=int((line.get("dimensions_cm") or {}).get("height") or 0),
             ))
+            shopping_list.append({
+                "sku": line.get("sku") or sku,
+                "name": str(line.get("name") or item.get("name") or "Item"),
+                "brand": line.get("brand", ""),
+                "category": line.get("category") or item.get("category", ""),
+                "quantity": qty,
+                "unit_price_inr": unit,
+                "line_total_inr": unit * qty,
+            })
 
         palette = None
         raw_palette = design.get("color_palette")
@@ -1614,25 +2246,43 @@ class DesignPipeline:
                 hex_codes=safe_list(raw_palette.get("hex_codes"))[:6],
             )
 
-        try:
-            est = int(float(design.get("estimated_cost_inr", 0) or 0))
-        except (TypeError, ValueError):
-            est = 0
-        # The code-computed total always wins over anything the model said.
-        if costed["line_items"]:
-            est = costed["estimated_cost_inr"]
+        # Brands come from the catalog rows that were actually bought.
+        brands = sorted({f.brand_suggestions[0] for f in furniture if f.brand_suggestions})
+
+        trade_offs = safe_list(design.get("trade_offs")) or safe_list(design.get("cons"))
+        vastu = design.get("_vastu") or {}
+        layout_description = _text(design.get("layout_description"), 4000)
+        room = (layout or {}).get("room") or {}
+        dimension_text = str(room.get("dimension_text") or "").strip()
+        if dimension_text:
+            numbers = set(re.findall(r"\d+(?:\.\d+)?", layout_description))
+            room_numbers = {
+                f"{room.get('width_ft'):g}",
+                f"{room.get('depth_ft'):g}",
+            }
+            if not room_numbers.issubset(numbers) or not re.search(
+                r"\b(?:ft|feet)\b", layout_description, re.I
+            ):
+                area = room.get("area_sqft")
+                area_text = f" (about {area:g} sq ft)" if isinstance(area, (int, float)) else ""
+                layout_description = (
+                    f"Room dimensions: {dimension_text}{area_text}. "
+                    f"{layout_description}"
+                ).strip()
 
         return DesignOption(
             title=str(design.get("title", "Design Option"))[:200],
             concept=_text(design.get("concept"), 4000),
-            layout_description=_text(design.get("layout_description"), 4000),
+            layout_description=layout_description,
             zones=safe_list(design.get("zones"))[:10],
             furniture=furniture,
             color_palette=palette,
             lighting_plan=_text(design.get("lighting_plan"), 2000),
             storage_strategy=_text(design.get("storage_strategy"), 2000),
             decor_suggestions=safe_list(design.get("decor_suggestions"))[:12],
-            estimated_cost_inr=max(0, est),
+            # The option total is the sum of the rows above it, by the one
+            # shared function the edit step and the PDF also use.
+            estimated_cost_inr=total_inr([f.model_dump() for f in furniture]),
             budget_breakdown=[
                 BudgetBreakdown(
                     category=str(b.get("category", "misc"))[:100],
@@ -1643,13 +2293,63 @@ class DesignPipeline:
                 for b in (costed["budget_breakdown"] or [])
                 if isinstance(b, dict)
             ][:10],
-            vastu_notes=safe_list(design.get("vastu_notes"))[:8],
-            brands=safe_list(design.get("brands"))[:10],
+            vastu_notes=safe_list(vastu.get("notes") or design.get("vastu_notes"))[:8],
+            vastu_results=list(vastu.get("results") or []),
+            vastu_score=vastu.get("score"),
+            trade_offs=trade_offs[:8],
+            brands=brands[:10],
             pros=safe_list(design.get("pros"))[:6],
             cons=safe_list(design.get("cons"))[:6],
+            shopping_list=shopping_list,
+            validation=report.to_dict(),
+            layout=layout,
             confidence_score=float(design.get("confidence_score", 0) or 0),
             revision_round=int(design.get("revision_round", 0) or 0),
         )
+
+    def _layout_for(
+        self,
+        design: Dict[str, Any],
+        costing: Dict[str, Any],
+        constraints: BriefConstraints,
+    ) -> Optional[Dict[str, Any]]:
+        """Compute the room plan from the same line items the option lists.
+
+        The old floor plan was built independently from the brief, so it could
+        contain different furniture from the option above it. It is now built
+        from the priced lines, with real dimensions and with the room's own
+        door and window bearings.
+        """
+        from app.engine.layout import place_furniture
+
+        dims = constraints.dimensions
+        if not dims.is_known():
+            return None
+        items = []
+        for line in costing.get("line_items") or []:
+            dims_cm = line.get("dimensions_cm") or {}
+            items.append({
+                "sku": line["sku"],
+                "name": line["name"],
+                "category": line.get("category", ""),
+                "width_cm": dims_cm.get("width", 0),
+                "depth_cm": dims_cm.get("depth", 0),
+                "height_cm": dims_cm.get("height", 0),
+                "quantity": line.get("quantity", 1),
+            })
+        try:
+            plan = place_furniture(
+                items,
+                room_width_cm=dims.width_cm,
+                room_depth_cm=dims.length_cm,
+                ceiling_cm=dims.ceiling_cm or 270,
+                door_direction=constraints.door_direction,
+                window_direction=constraints.window_direction,
+            )
+        except Exception as exc:  # a plan is optional; never fail the design for it
+            logger.warning("layout_failed error=%s", exc)
+            return None
+        return plan.to_dict()
 
 
 design_pipeline = DesignPipeline()

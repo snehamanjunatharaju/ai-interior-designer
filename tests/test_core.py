@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from app.core.config import Settings
+from app.core.config import Settings, _default_llm_providers
 from app.core.observability import MetricsRegistry
 from app.core.schemas import DesignOption, DesignRequest
 from app.core.security import RateLimiter, verify_api_key
@@ -49,6 +49,10 @@ class TestConfig:
     def test_production_detection(self):
         assert Settings(ENVIRONMENT="production").is_production
         assert not Settings(ENVIRONMENT="development").is_production
+
+    def test_production_defaults_to_hosted_llm_providers(self):
+        assert _default_llm_providers("production") == ["openai", "anthropic"]
+        assert _default_llm_providers("development")[0] == "ollama"
 
     def test_pricing_has_ollama_free(self):
         assert Settings().pricing_inr["ollama"] == 0.0

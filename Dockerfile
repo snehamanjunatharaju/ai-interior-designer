@@ -37,7 +37,7 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/api/v1/health').status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; port=os.getenv('PORT','8001'); sys.exit(0 if urllib.request.urlopen(f'http://localhost:{port}/api/v1/health').status==200 else 1)"
 
 # One worker per container; scale horizontally with replicas instead.
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
+CMD ["sh", "-c", "python -m uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8001}\" --workers 1"]

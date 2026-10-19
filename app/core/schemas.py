@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # --------------------------------------------------------------------------
@@ -78,6 +78,31 @@ class DesignRequest(BaseModel):
     room_dimensions: Optional[str] = Field(
         default=None, description='e.g. "12ft x 10ft, ceiling 9ft"'
     )
+    # Explicit Length / Width in feet.
+    #
+    # Added because a free-text dimension field is parsed, and parsing guesses.
+    # "about 12 by 10" is ambiguous; "12ft x 10ft" and "240cm x 200cm" are not.
+    # A floor plan drawn from a guessed room size is a floor plan of the wrong
+    # room, and nothing downstream can tell the client that - the plan looks
+    # perfectly valid. So the structured fields are the source of truth when
+    # present, and the free-text field remains only as a fallback for callers
+    # that have not migrated.
+    #
+    # Bounds are deliberately generous but finite: 4ft is smaller than any real
+    # room and 100ft is larger than any Indian apartment, so a typo is caught
+    # at the boundary instead of producing an unplaceable layout.
+    length_ft: Optional[float] = Field(
+        default=None, ge=4, le=100,
+        description="Room length in feet. Preferred over free text.",
+    )
+    width_ft: Optional[float] = Field(
+        default=None, ge=4, le=100,
+        description="Room width in feet. Preferred over free text.",
+    )
+    ceiling_ft: Optional[float] = Field(
+        default=None, ge=6, le=20,
+        description="Ceiling height in feet. Optional; defaults to 9ft.",
+    )
     # Optional compass inputs. Free-text directions inside the brief are
     # still parsed, but an explicit field is authoritative and avoids the
     # ambiguity of "the window faces the morning light".
@@ -109,6 +134,85 @@ class DesignRequest(BaseModel):
                 seen.add(key)
                 out.append(item.strip())
         return out
+
+    @model_validator(mode="after")
+    def _both_dimensions_or_neither(self) -> "DesignRequest":
+        """
+        Length without width is not a room.
+
+        Accepting one and defaulting the other invents a dimension, which is
+        the exact failure the structured fields exist to prevent. Rejecting it
+        here is better than drawing a plan for a room that is half imaginary.
+        """
+        if (self.length_ft is None) != (self.width_ft is None):
+            raise ValueError(
+                "Provide both length_ft and width_ft, or neither. A single "
+                "dimension is not enough to draw a floor plan."
+            )
+        return self
+
+    def dimension_text(self) -> str:
+        """
+        The structured dimensions as parseable text, or the free text.
+
+        Lets every existing consumer of `room_dimensions` pick up the new
+        fields without each one being rewritten.
+        """
+        if self.length_ft and self.width_ft:
+            base = f"{self.length_ft:g}ft x {self.width_ft:g}ft"
+            if self.ceiling_ft:
+                base += f", ceiling {self.ceiling_ft:g}ft"
+            return base
+        return self.room_dimensions or ""
+
+    def brief_object(self) -> Dict[str, Any]:
+        """
+        The whole submitted form as one structured object.
+
+        This is what every agent is given, and what the validator reads. It
+        exists because the agents used to each re-derive the brief from prose:
+        the architect saw a text rendering, the validator saw a separately
+        parsed constraint set, and the form's own door/window/colour/vastu
+        selections reached neither. One object means one answer to "what did
+        the client ask for?".
+        """
+        raw_dims = (self.room_dimensions or "").strip()
+        dims = None
+        if self.length_ft and self.width_ft:
+            dims = {
+                "length_ft": self.length_ft,
+                "width_ft": self.width_ft,
+                "ceiling_ft": self.ceiling_ft,
+            }
+        elif raw_dims:
+            # Free text is kept verbatim and parsed in code, once, so the
+            # numeric view below and the parser cannot disagree.
+            from app.engine.brief import parse_dimensions
+
+            parsed = parse_dimensions(raw_dims)
+            if parsed.is_known():
+                dims = {
+                    "length_ft": parsed.length_ft,
+                    "width_ft": parsed.width_ft,
+                    "ceiling_ft": parsed.ceiling_ft,
+                }
+        return {
+            "room_type": self.room_type.value,
+            "style": self.style.value,
+            "dimensions": dims,
+            "dimensions_text": self.dimension_text(),
+            "door_direction": self.door_direction,
+            "window_direction": self.window_direction,
+            "color_scheme": self.color_scheme,
+            "vastu_level": self.vastu_compliance.value,
+            "budget_tier": self.budget.value,
+            "budget_inr": self.budget_amount_inr,
+            "occupants": list(self.occupants),
+            "furniture": list(self.furniture),
+            "special_requirements": list(self.specific_requirements),
+            "lifestyle_notes": self.lifestyle_notes,
+            "client_brief": self.client_preferences,
+        }
 
 
 class RetrievalRequest(BaseModel):
@@ -173,10 +277,29 @@ class DesignOption(BaseModel):
     decor_suggestions: List[str] = Field(default_factory=list)
     estimated_cost_inr: int = 0
     budget_breakdown: List[BudgetBreakdown] = Field(default_factory=list)
+    # Vastu notes are generated from the rule-check results, never from model
+    # prose, so a note cannot claim compliance the code check contradicts.
     vastu_notes: List[str] = Field(default_factory=list)
+    # The rule results themselves, so the UI and PDF can show what passed and
+    # what failed rather than only the sentences summarising them.
+    vastu_results: List[Dict[str, Any]] = Field(default_factory=list)
+    vastu_score: Optional[int] = None
+    # Honest trade-offs, kept apart from the Vastu notes. "Limited decorative
+    # flexibility" is a trade-off, not a Vastu observation, and mixing the two
+    # made the Vastu section read as nonsense.
+    trade_offs: List[str] = Field(default_factory=list)
     brands: List[str] = Field(default_factory=list)
     pros: List[str] = Field(default_factory=list)
     cons: List[str] = Field(default_factory=list)
+    # The same rows the option total is computed from, with quantity, unit
+    # price and line total. Present as a field so no client has to recompute
+    # a price from anywhere else.
+    shopping_list: List[Dict[str, Any]] = Field(default_factory=list)
+    # Deterministic brief check for this option specifically. The response-level
+    # `validation` describes the design that won the reflection loop.
+    validation: Optional[Dict[str, Any]] = None
+    # Dimensions and zone sizes, so the layout text and the plan agree.
+    layout: Optional[Dict[str, Any]] = None
     confidence_score: float = 0.0
     critic_score: Optional[float] = None
     revision_round: int = 0
@@ -225,6 +348,28 @@ class DesignResponse(BaseModel):
     # the best attempt anyway, still failing its brief checks. The UI must
     # show this rather than presenting an unchecked design as final.
     partial: bool = False
+
+    # Everything the design had to assume rather than measure, plus whether the
+    # Vastu claim is verifiable. A Strict-Vastu brief with no door or window
+    # bearing sets `vastu_withheld`, and the UI must not show a compliance
+    # score it cannot justify.
+    assumptions: Optional[Dict[str, Any]] = None
+
+    # Options dropped as near-duplicates, with the reason. Present so a client
+    # who asked for three and received two is told why rather than left to
+    # assume something failed.
+    rejected_options: List[str] = Field(default_factory=list)
+
+    # Per-option self-consistency findings: colour chips vs swatch labels,
+    # requested items vs shopping list, prose vs what was bought. A design can
+    # satisfy the validator and still disagree with itself, and the client is
+    # the one who notices.
+    consistency: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # Each revision the reflection loop produced, in order, with its score and
+    # whether it was blocking-clean. The best one is returned; this is the
+    # evidence for that choice.
+    revisions: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class EvaluationScore(BaseModel):

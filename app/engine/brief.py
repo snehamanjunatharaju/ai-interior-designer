@@ -26,11 +26,15 @@ Supported extractions
 from __future__ import annotations
 
 import re
-import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from app.catalog.store import TIER_ESSENTIAL, CatalogItem
+from app.engine.occupants import (
+    infer_audience,
+    requires_wfh_kit,
+    required_categories_for,
+)
 
 # --------------------------------------------------------------------------
 # Vocabularies
@@ -55,6 +59,20 @@ ITEM_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "table": ("table", "side table", "coffee table"),
     "lighting": ("lamp", "light", "lighting"),
     "paint": ("paint", "wall colour", "wall color", "paint the wall"),
+    # Kitchen vocabulary. Without these, a kitchen brief asking for cabinets
+    # and a chimney parsed to no required items, so nothing checked that they
+    # were actually bought.
+    "kitchen_cabinets": ("overhead cabinet", "overhead cabinets", "wall cabinet",
+                         "wall cabinets", "base unit", "base units"),
+    "kitchen_open_shelf": ("open shelf", "open shelves", "open shelving"),
+    "kitchen_pantry": ("pantry", "pantry unit", "tall unit"),
+    "kitchen_trolley": ("trolley", "kitchen cart", "serving cart"),
+    "kitchen_ventilation": ("chimney", "exhaust fan", "exhaust", "ventilation",
+                            "hob hood"),
+    "kitchen_backsplash": ("backsplash", "back splash", "splashback"),
+    "kitchen_countertop": ("countertop", "counter top", "granite counter",
+                           "kitchen counter"),
+    "kitchen_sink": ("sink", "kitchen sink"),
 }
 
 COLOR_SCHEMES: Dict[str, Tuple[str, ...]] = {
@@ -62,11 +80,26 @@ COLOR_SCHEMES: Dict[str, Tuple[str, ...]] = {
     "pastel": ("pastel", "soft pastel", "baby colours", "baby colors"),
     "neutral": ("neutral", "beige", "greige", "off white", "off-white"),
     "monochrome": ("monochrome", "black and white", "greyscale", "grayscale"),
-    "earthy": ("earthy", "terracotta", "rust", "clay"),
-    "cool": ("cool toned", "cool-toned", "blue", "bluer", "teal"),
-    "warm": ("warm toned", "warm-toned", "warm"),
-    "earthy_green": ("olive", "sage", "green"),
+    "earthy_green": ("olive", "sage"),
+    "cool": ("cool tones", "cool toned", "cool-toned", "blue", "bluer", "teal", "navy"),
+    "warm": ("warm tones", "warm toned", "warm-toned", "warm"),
     "jewel": ("jewel tone", "jewel tones", "emerald", "sapphire"),
+    # The form's own option label. "Warm Earthy" selected on the form must
+    # parse as earthy, not just as "warm" - the two presets have different
+    # palettes, and picking the wrong one is how a Warm Earthy brief came back
+    # with navy, sky blue and teal.
+    "earthy": ("warm earthy", "earthy", "terracotta", "rust", "clay", "warm clay"),
+}
+
+# Colour-scheme aliases from the form and from prose, mapped to a canonical
+# scheme name. Checked before the generic keyword scan.
+COLOR_SCHEME_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "neutral": ("neutral tones", "neutral", "beige", "greige", "off white", "off-white"),
+    "warm": ("warm earthy", "warm", "warm neutral", "warm neutrals"),
+    "pastel": ("soft pastels", "pastel", "baby colours", "baby colors"),
+    "monochrome": ("monochrome", "black and white", "greyscale", "grayscale"),
+    "vibrant": ("vibrant", "bright", "bold", "colourful", "colorful", "playful"),
+    "earthy": ("earthy", "terracotta", "rust", "clay"),
 }
 
 # Directions, normalised to full words.
@@ -126,6 +159,16 @@ BRIEF_TO_CATALOG_CATEGORY: Dict[str, Tuple[str, ...]] = {
     "paint": ("paint",),
     "bed": ("bed",),
     "desk": ("desk",),
+    # Every kitchen term resolves to the single `kitchen` catalog category;
+    # ACCEPTABLE_PRODUCTS below narrows each to the right product type.
+    "kitchen_cabinets": ("kitchen",),
+    "kitchen_open_shelf": ("kitchen",),
+    "kitchen_pantry": ("kitchen",),
+    "kitchen_trolley": ("kitchen",),
+    "kitchen_ventilation": ("kitchen",),
+    "kitchen_backsplash": ("kitchen",),
+    "kitchen_countertop": ("kitchen",),
+    "kitchen_sink": ("kitchen",),
 }
 
 # Where the catalog category is too coarse, these say which specific product
@@ -140,6 +183,16 @@ ACCEPTABLE_PRODUCTS: Dict[str, Tuple[str, ...]] = {
     "bookshelf": ("bookshelf", "book shelf", "shelf", "shelving", "cube", "storage"),
     # A mirror is a decor-category product, but a planter is not a mirror.
     "mirror": ("mirror",),
+    # Without these, a "chimney" request would be satisfied by any kitchen
+    # item and the checker would pass a design with no ventilation at all.
+    "kitchen_cabinets": ("overhead", "wall cabinet", "base unit"),
+    "kitchen_open_shelf": ("open shelf", "shelf"),
+    "kitchen_pantry": ("pantry",),
+    "kitchen_trolley": ("trolley",),
+    "kitchen_ventilation": ("chimney", "exhaust"),
+    "kitchen_backsplash": ("backsplash",),
+    "kitchen_countertop": ("countertop",),
+    "kitchen_sink": ("sink",),
 }
 
 CATEGORIES_WITH_QUANTITY = {"bed", "mattress", "chair", "sofa", "armchair",
@@ -305,10 +358,77 @@ def mentions_item(text: str, item: str) -> bool:
 def parse_color_scheme(text: str) -> Optional[str]:
     """Return the canonical colour-scheme keyword, or None."""
     lower = text.lower()
+    # Exact aliases first (longest phrase wins), so "warm earthy" does not
+    # degrade to "warm" just because that word is a substring of it.
+    for canonical in sorted(COLOR_SCHEME_ALIASES, key=lambda c: -max(
+        len(w) for w in COLOR_SCHEME_ALIASES[c]
+    )):
+        words = sorted(COLOR_SCHEME_ALIASES[canonical], key=len, reverse=True)
+        for word in words:
+            if re.search(rf"\b{re.escape(word)}\b", lower):
+                return canonical
     for canonical, words in COLOR_SCHEMES.items():
-        if any(w in lower for w in words):
+        if any(re.search(rf"\b{re.escape(w)}\b", lower) for w in words):
             return canonical
     return None
+
+
+def normalize_color_scheme(value: Optional[str]) -> Optional[str]:
+    """Map a form option or prose phrase to a canonical scheme name.
+
+    Returns the canonical name for a known scheme, and the cleaned input
+    otherwise (so a scheme the form adds later still reaches the validator
+    rather than being silently dropped).
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    found = parse_color_scheme(text)
+    return found or text
+
+
+# Special requirements as the form offers them, with the keyword set each
+# one is checked against. The form sends `kids_safe`; the design mentions
+# "non-toxic". This table is the join between the two vocabularies.
+REQUIREMENT_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "kids_safe": (
+        "kid", "child", "non-toxic", "non toxic", "rounded", "soft corner",
+        "anchored", "anti-skid", "anti skid", "low height", "safety",
+    ),
+    "storage_heavy": (
+        "storage", "wardrobe", "cabinet", "drawer", "shelving", "pantry",
+        "under-bed", "loft", "chest",
+    ),
+    "low_maintenance": (
+        "low-maintenance", "low maintenance", "wipe", "washable", "easy-clean",
+        "easy clean", "durable", "stain-resistant", "matte", "laminate",
+    ),
+    "natural_light": (
+        "natural light", "daylight", "window", "sheer", "curtain", "mirror",
+        "light-toned", "glare",
+    ),
+    "storage": (
+        "storage", "wardrobe", "cabinet", "drawer", "shelving", "pantry",
+    ),
+    "reading_nook": ("reading", "nook", "chair", "lamp", "armchair"),
+    "work_from_home": ("desk", "work", "chair", "task light", "study"),
+    "entertainment": ("tv", "television", "media", "speaker", "seating"),
+    "pet_friendly": ("pet", "washable", "scratch", "durable", "wipe"),
+}
+
+# Human labels for the requirements, so a failure reads as the client's own
+# words rather than a slug.
+REQUIREMENT_LABELS: Dict[str, str] = {
+    "kids_safe": "Kids Safe",
+    "storage_heavy": "Heavy Storage",
+    "storage": "Heavy Storage",
+    "low_maintenance": "Low Maintenance",
+    "natural_light": "Natural Light",
+    "reading_nook": "Reading Nook",
+    "work_from_home": "Work From Home",
+    "entertainment": "Entertainment",
+    "pet_friendly": "Pet Friendly",
+}
 
 
 def parse_direction(text: str) -> Optional[str]:
@@ -320,6 +440,29 @@ def parse_direction(text: str) -> Optional[str]:
         if re.search(rf"\b{direction}\b", lower):
             return direction
     return None
+
+
+def normalize_direction(value: Optional[str]) -> Optional[str]:
+    """Map any spelling of a compass point to the canonical word.
+
+    "NE", "N.E.", "north-east", "North East" and "northeast" all mean the
+    same wall. The form sent "north" and the layout said "NE" only because
+    two different code paths spelled it differently; one normaliser fixes
+    that at the boundary.
+    """
+    if not value:
+        return None
+    raw = str(value).strip().lower()
+    compact = re.sub(r"[\s._-]+", "", raw)
+    abbreviations = {
+        "n": "north", "s": "south", "e": "east", "w": "west",
+        "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
+    }
+    if compact in abbreviations:
+        return abbreviations[compact]
+    # "northeast", "southwest", "southeast", "northwest" survive the
+    # de-separation unchanged; the bare cardinals do too.
+    return compact if compact in DIRECTIONS else None
 
 
 def parse_directions(text: str) -> Dict[str, str]:
@@ -474,14 +617,24 @@ def catalog_categories_for(brief_term: Optional[str]) -> Tuple[str, ...]:
     return BRIEF_TO_CATALOG_CATEGORY.get(brief_term or "", (brief_term or "",))
 
 
-def find_products(term: Optional[str], limit: int = 0) -> List[CatalogItem]:
+def find_products(
+    term: Optional[str],
+    limit: int = 0,
+    audience: str = "any",
+) -> List[CatalogItem]:
     """
     Resolve a brief term to real catalog products, cheapest viable first.
 
     Accepts None so callers can pass an optional brief term without guarding.
     `limit` caps the number returned; 0 means all matches.
+
+    `audience` filters the results. This is where B1 is actually enforced: an
+    adults-only room asking for a "desk" must not be handed the Kids Study
+    Table, and the only thing that knows the difference is the catalog's
+    `audience` column.
     """
     from app.catalog import catalog
+    from app.engine.occupants import filter_products
 
     if not term:
         return []
@@ -489,6 +642,9 @@ def find_products(term: Optional[str], limit: int = 0) -> List[CatalogItem]:
     results: List[CatalogItem] = []
     for category in catalog_categories_for(term):
         results.extend(catalog.by_category(category))
+    if not results:
+        return []
+    results = filter_products(results, audience)
     if not results:
         return []
     # Cheapest first so an automatic pick never blows a tight budget.
@@ -514,7 +670,9 @@ def canonical_item_for(text: str) -> str:
     return lower
 
 
-def products_satisfying(term: str, limit: int = 0) -> List[CatalogItem]:
+def products_satisfying(
+    term: str, limit: int = 0, audience: str = "any"
+) -> List[CatalogItem]:
     """
     Products that genuinely satisfy a brief term, not merely share a category.
 
@@ -522,11 +680,14 @@ def products_satisfying(term: str, limit: int = 0) -> List[CatalogItem]:
     whole category as interchangeable would let a Rs 1,600 stool satisfy a
     request for a sofa, which is both a validation false negative and a way
     for an automatic insert to quietly under-deliver on the brief.
+
+    `audience` is threaded through so an adults-only room never resolves to a
+    kids' product here either.
     """
     from app.catalog import catalog
 
     catalog.initialize()
-    products = find_products(term)
+    products = find_products(term, audience=audience)
     acceptable = ACCEPTABLE_PRODUCTS.get(term)
     if not acceptable:
         return products[:limit] if limit else products
@@ -601,6 +762,9 @@ class BriefConstraints:
     room_type: str = ""
     style: str = ""
     color_scheme: Optional[str] = None
+    # The colour scheme exactly as submitted ("Warm Earthy"), which is what
+    # the palette is keyed on. `color_scheme` is the canonical token.
+    form_color_scheme: str = ""
     budget_inr: Optional[int] = None
     dimensions: RoomDimensions = field(default_factory=RoomDimensions)
     vastu_compliance: str = "soft"
@@ -616,15 +780,31 @@ class BriefConstraints:
     window_direction: Optional[str] = None
     # Number of people the room must serve, inferred from the brief.
     occupant_count: Optional[int] = None
+    # The form's special-requirement chips, in their submitted form
+    # ("kids_safe", "storage_heavy", ...). Kept verbatim so the validator can
+    # say "Kids Safe was selected but not addressed" in the client's own terms.
+    special_requirements: List[str] = field(default_factory=list)
+    # The lifestyle note, kept separate from the concatenated brief text so
+    # agents can tell a passing remark from a hard requirement.
+    lifestyle_notes: str = ""
+    # The palette the selected colour scheme defines. Set by `parse_brief` so
+    # the pipeline can install it rather than trusting the model's colours.
+    palette: Dict[str, object] = field(default_factory=dict)
 
     occupants: List[str] = field(default_factory=list)
     raw_text: str = ""
+    # "adult" | "kids" | "any" - see app.engine.occupants.
+    audience: str = "any"
+    # True when the brief describes a work-from-home setup, which makes a desk
+    # AND a chair mandatory.
+    requires_workstation: bool = False
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "room_type": self.room_type,
             "style": self.style,
             "color_scheme": self.color_scheme,
+            "form_color_scheme": self.form_color_scheme,
             "budget_inr": self.budget_inr,
             "dimensions": self.dimensions.to_dict(),
             "vastu_compliance": self.vastu_compliance,
@@ -635,6 +815,10 @@ class BriefConstraints:
             "window_direction": self.window_direction,
             "occupant_count": self.occupant_count,
             "occupants": list(self.occupants),
+            "audience": self.audience,
+            "requires_workstation": self.requires_workstation,
+            "special_requirements": list(self.special_requirements),
+            "lifestyle_notes": self.lifestyle_notes,
         }
 
     def is_checkable(self) -> bool:
@@ -653,6 +837,9 @@ def parse_brief(
     budget_inr: Optional[int] = None,
     vastu_compliance: str = "soft",
     room_dimensions: str = "",
+    door_direction: Optional[str] = None,
+    window_direction: Optional[str] = None,
+    lifestyle_notes: str = "",
 ) -> BriefConstraints:
     """
     Parse a full brief into checkable constraints.
@@ -661,6 +848,9 @@ def parse_brief(
     signal, then the structured furniture/requirement lists, then the
     explicit form fields (which the user selected deliberately and so
     override anything guessed from prose).
+
+    The compass fields are the form's own selects, so they are authoritative:
+    the prose fallback is only consulted when a direction was not supplied.
     """
     furniture = furniture or []
     specific_requirements = specific_requirements or []
@@ -670,7 +860,8 @@ def parse_brief(
     # included because "2 beds" is often written there, not in the prose.
     text = " ".join(
         part for part in [client_preferences or ""] + furniture
-        + specific_requirements + occupants + [room_dimensions or ""]
+        + specific_requirements + occupants
+        + [room_dimensions or "", lifestyle_notes or ""]
         if part
     )
 
@@ -679,6 +870,8 @@ def parse_brief(
         style=style or "",
         vastu_compliance=vastu_compliance,
         occupants=list(occupants),
+        special_requirements=[str(r).strip() for r in specific_requirements if str(r).strip()],
+        lifestyle_notes=lifestyle_notes or "",
         raw_text=text,
     )
 
@@ -686,19 +879,36 @@ def parse_brief(
     bc.budget_inr = budget_inr if budget_inr else parse_money(text)
 
     # -- colour: explicit select wins, else infer ------------------------
-    if color_scheme and color_scheme.lower() != "neutral":
-        bc.color_scheme = color_scheme.lower()
+    # The select is what the user picked; prose only fills in when the select
+    # is the default "neutral", and even then "Warm Earthy" in the select is
+    # kept verbatim as the source of truth for the palette.
+    selected = normalize_color_scheme(color_scheme)
+    bc.form_color_scheme = (color_scheme or "").strip()
+    if selected and selected != "neutral":
+        bc.color_scheme = selected
     else:
         inferred = parse_color_scheme(text)
-        bc.color_scheme = inferred or (color_scheme.lower() if color_scheme else None)
+        bc.color_scheme = inferred or selected
+    # Build the palette from the selected scheme, once, in code. The model
+    # is not asked to invent colours for a named scheme any more.
+    from app.engine.palette import palette_for
+
+    bc.palette = palette_for(bc.form_color_scheme or bc.color_scheme)
 
     # -- dimensions -------------------------------------------------------
     bc.dimensions = parse_dimensions(text)
 
     # -- directions -------------------------------------------------------
+    # The form's selects are authoritative. Only when one was not supplied is
+    # the prose scanned - and both are normalised, so "NE" from the prose and
+    # "northeast" from the form are the same wall.
     directions = parse_directions(text)
-    bc.door_direction = directions.get("door") or directions.get("entrance")
-    bc.window_direction = directions.get("window")
+    bc.door_direction = normalize_direction(door_direction) or normalize_direction(
+        directions.get("door") or directions.get("entrance")
+    )
+    bc.window_direction = normalize_direction(window_direction) or normalize_direction(
+        directions.get("window")
+    )
 
     # -- item quantities --------------------------------------------------
     # Iterate over the canonical item vocabulary so "2 beds" -> {"bed": 2}.
@@ -736,7 +946,31 @@ def parse_brief(
     ]
     bc.excluded_items = sorted(set(bc.excluded_items) - set(bc.required_items))
 
+    # -- audience and use-case --------------------------------------------
+    # Resolved here so every downstream consumer (catalog lookup, optimizer,
+    # validator) reads one decision instead of re-parsing the brief.
+    bc.audience = infer_audience(occupants=occupants, free_text=text)
+    bc.requires_workstation = requires_wfh_kit(
+        occupants=occupants, free_text=text, room_type=room_type
+    )
+    for category, qty in required_categories_for(
+        bc.audience, bc.requires_workstation
+    ).items():
+        bc.required_items[category] = max(bc.required_items.get(category, 0), qty)
+        if category in bc.optional_items:
+            bc.optional_items.remove(category)
+
     # Last: infer a bed per occupant where the brief implies it.
     infer_counts_from_occupants(bc)
+
+    # A kitchen has a non-negotiable working set: storage above the counter,
+    # a vent for Indian cooking, and light over the work surface. The review
+    # found a kitchen shopping list with no exhaust fan, no chimney and no
+    # overhead storage at all. These are required as a baseline, in addition
+    # to anything the client explicitly asked for; if the budget cannot cover
+    # them the validator reports a budget constraint, not a missing item.
+    if bc.room_type == "kitchen":
+        for item in ("kitchen_cabinets", "kitchen_ventilation"):
+            bc.required_items.setdefault(item, 1)
 
     return bc
