@@ -109,6 +109,27 @@ def infer_metadata(content: str, category: str = "") -> Dict[str, object]:
         tier for tier, words in BUDGET_KEYWORDS.items()
         if any(w in text for w in words)
     ]
+    window_directions: List[str] = []
+    direction_aliases = (
+        ("northeast", ("northeast", "north east", "north-east")),
+        ("northwest", ("northwest", "north west", "north-west")),
+        ("southeast", ("southeast", "south east", "south-east")),
+        ("southwest", ("southwest", "south west", "south-west")),
+        ("north", ("north",)), ("south", ("south",)),
+        ("east", ("east",)), ("west", ("west",)),
+    )
+    for canonical, aliases in direction_aliases:
+        for alias in aliases:
+            if re.search(
+                rf"\b{re.escape(alias)}(?:[- ]facing)?\s+windows?\b", text
+            ) or re.search(
+                rf"\b{re.escape(alias)}\s+windows?\b", text
+            ) or re.search(
+                rf"\bwindows?\s+(?:face|faces|facing|on|to|in)\s+"
+                rf"{re.escape(alias)}\b", text
+            ):
+                window_directions.append(canonical)
+                break
     vastu = any(w in text for w in VASTU_KEYWORDS)
 
     return {
@@ -116,6 +137,7 @@ def infer_metadata(content: str, category: str = "") -> Dict[str, object]:
         "rooms": rooms,
         "styles": styles,
         "budget_tiers": tiers,
+        "window_directions": window_directions,
         "vastu": vastu,
     }
 
@@ -147,6 +169,7 @@ def matches_filter(
     room: Optional[str] = None,
     style: Optional[str] = None,
     budget_tier: Optional[str] = None,
+    window_direction: Optional[str] = None,
     require_vastu: bool = False,
 ) -> bool:
     """
@@ -167,6 +190,13 @@ def matches_filter(
     if budget_tier:
         tiers = meta.get("budget_tiers") or []
         if tiers and budget_tier not in tiers:
+            return False
+    if window_direction:
+        directions = meta.get("window_directions") or []
+        requested = (
+            window_direction.lower().replace("-", "").replace(" ", "")
+        )
+        if directions and requested not in directions:
             return False
     if require_vastu and not meta.get("vastu"):
         return False

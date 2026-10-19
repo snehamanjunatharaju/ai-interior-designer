@@ -23,6 +23,8 @@
     }
 
     function displayLabel(value) {
+        const raw = String(value || "").toLowerCase();
+        if (raw === "soft") return "Rugs & soft furnishings";
         return String(value || "")
             .replace(/_/g, " ")
             .replace(/\b[a-z]/g, (letter) => letter.toUpperCase())
@@ -255,6 +257,7 @@
             if (shippedVastu && shippedVastu.length) {
                 const first = data.options[0];
                 showVastu({
+                    optionTitle: first.title || "Option 1",
                     score: first.vastu_score != null ? first.vastu_score : 0,
                     grade: "",
                     passed: shippedVastu.filter((r) => r.passed).length,
@@ -321,6 +324,7 @@
             );
             const ok = v.score >= 75 && !(strict && failedStrong);
             $("vastuMeta").innerHTML =
+                (v.optionTitle ? `<span class="chip">${esc(v.optionTitle)} Vastu</span> ` : "") +
                 `<span class="chip ${ok ? "good" : v.score >= 60 ? "warn" : "bad"}">` +
                 `${v.score} / 100</span>` +
                 (v.grade ? ` <span class="chip">${esc(v.grade)}</span>` : "") +
@@ -359,6 +363,10 @@
         box.hidden = false;
         const names = (currentDesign && currentDesign.furniture || [])
             .map((item) => item.name).filter(Boolean);
+        const input = $("refineInput");
+        if (input && names.length) {
+            input.placeholder = `Change ${names[0]} (e.g. make it bigger)`;
+        }
         const suggestions = names.slice(0, 3).flatMap((name) => [
             `Make ${name} bigger`,
             `Remove ${name}`,
@@ -640,12 +648,11 @@
         // A high score next to blocking issues is the contradiction the client
         // sees first. When the code check has blocking issues, the overall is
         // shown as "withheld" rather than as a good-looking number.
-        const validatorViolations = [
-            ...((validation && validation.violations) || []),
-            ...((options || []).flatMap((option) =>
+        const validatorViolations = options && options.length
+            ? options.flatMap((option) =>
                 (option.validation && option.validation.violations) || []
-            )),
-        ];
+            )
+            : ((validation && validation.violations) || []);
         const blocking = validatorViolations
             .filter((v) => v.severity === "error");
         const rows = blocking.length ? "" : Object.entries(evaluation.scores)
@@ -815,6 +822,10 @@
                 : ""}
 
             <p class="concept">${esc(option.concept)}</p>
+
+            ${option.vastu_score != null
+                ? `<p class="muted small">Vastu score for this option: ${option.vastu_score}/100</p>`
+                : ""}
 
             ${swatches ? `<div class="palette">${swatches}${hexes}</div>` : ""}
 

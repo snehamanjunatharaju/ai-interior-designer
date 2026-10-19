@@ -47,6 +47,15 @@ CATEGORY_ROOMS: dict[str, tuple[str, ...]] = {
     "seating": ("living_room", "balcony", "bedroom", "kids_room"),
     "table": ("living_room", "dining", "bedroom", "home_office"),
     "kitchen": ("kitchen", "dining"),
+    "lighting": (
+        "living_room", "bedroom", "kids_room", "home_office", "dining",
+        "kitchen", "bathroom", "balcony", "entrance",
+    ),
+    "soft": ("living_room", "bedroom", "kids_room", "dining", "balcony"),
+    "decor": (
+        "living_room", "bedroom", "kids_room", "dining", "kitchen",
+        "bathroom", "balcony", "entrance",
+    ),
 }
 
 # Who each category is for, independent of room. A bean bag or a coffee table
@@ -171,6 +180,11 @@ SEED_ITEMS: list[CatalogItem] = [
         "https://urbanladder.com/",
     ),
     CatalogItem(
+        "STO-CAB-01", "Closed Storage Cabinet - 2 Door", "storage", "Nilkamal",
+        6900, 80, 40, 100, TIER_STANDARD,
+        "https://www.nilkamalfurniture.com/",
+    ),
+    CatalogItem(
         "STO-SHLF-01", "Floating Wall Shelf 90cm", "storage", "Hometown",
         1300, 90, 20, 25, TIER_ESSENTIAL,
         "https://www.hometownfurniture.com/",
@@ -188,6 +202,16 @@ SEED_ITEMS: list[CatalogItem] = [
     CatalogItem(
         "SOF-2S-01", "2-Seater Sofa - Fabric", "seating", "Urban Ladder",
         18500, 150, 85, 80, TIER_UPGRADE,
+        "https://urbanladder.com/",
+    ),
+    CatalogItem(
+        "SOF-3S-01", "3-Seater Sofa - Cotton Blend", "seating", "Wakefit",
+        26500, 210, 90, 82, TIER_UPGRADE,
+        "https://www.wakefit.co/",
+    ),
+    CatalogItem(
+        "SOF-SEC-01", "Compact 4-Seat Sectional Sofa", "seating", "Urban Ladder",
+        34500, 230, 155, 82, TIER_UPGRADE,
         "https://urbanladder.com/",
     ),
     CatalogItem(
@@ -221,6 +245,16 @@ SEED_ITEMS: list[CatalogItem] = [
         "TBL-COF-01", "Coffee Table - Sheesham", "table", "Urban Ladder",
         6800, 100, 50, 40, TIER_UPGRADE,
         "https://urbanladder.com/",
+    ),
+    CatalogItem(
+        "TBL-COF-02", "Coffee Table - Metal and Wood", "table", "Wakefit",
+        5200, 90, 45, 38, TIER_STANDARD,
+        "https://www.wakefit.co/",
+    ),
+    CatalogItem(
+        "TBL-SID-CL-01", "Closed Storage Side Table", "table", "Nilkamal",
+        3900, 45, 45, 50, TIER_STANDARD,
+        "https://www.nilkamalfurniture.com/",
     ),
     CatalogItem(
         "TBL-SID-01", "Side Table - Round 40cm", "table", "Hometown",

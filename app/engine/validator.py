@@ -212,6 +212,7 @@ def validate_design(
 
     _check_required_items(design, brief, report)
     _check_selected_furniture(design, brief, report)
+    _check_seating_capacity(design, brief, report)
     _check_excluded_items(design, brief, report)
     _check_audience(design, brief, report)
     _check_room_appropriate(design, brief, report)
@@ -551,6 +552,44 @@ def _check_selected_furniture(
             actual="not purchased",
             remedy_hint=f"Add the selected '{selected}' product from the catalog.",
         ))
+
+
+def _check_seating_capacity(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    required = getattr(brief, "seating_capacity", None)
+    if not required or brief.room_type != "living_room":
+        return
+    from app.engine.brief import seats_per_product
+
+    seated = 0
+    for entry in design.get("furniture", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        product = catalog.get(str(entry.get("sku", "")).strip())
+        if product is None or product.category != "seating":
+            continue
+        try:
+            quantity = max(1, int(float(entry.get("quantity", 1) or 1)))
+        except (TypeError, ValueError):
+            quantity = 1
+        seated += seats_per_product(product.name) * quantity
+
+    report.checks_run += 1
+    if seated >= required:
+        report.checks_passed += 1
+        return
+    report.violations.append(Violation(
+        code="seating_capacity",
+        severity=SEVERITY_ERROR,
+        message=(
+            f"The living room needs seating for {required}, but the catalog "
+            f"items provide {seated} seat(s)."
+        ),
+        expected=f"at least {required} seats",
+        actual=f"{seated} seats",
+        remedy_hint="Add sofa or armchair products from the catalog until capacity is met.",
+    ))
 
 
 def _check_vastu_rules(

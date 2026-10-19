@@ -545,6 +545,26 @@ def build_proposal_pdf(
         styles["small"],
     ))
 
-    doc.build(flow, onFirstPage=_footer, onLaterPages=_footer)
+    unresolved = bool(
+        validation
+        and any(
+            issue.get("severity") == "error"
+            for issue in validation.get("violations", [])
+        )
+    )
+    if unresolved:
+        def draft_footer(canvas, page_doc):
+            _footer(canvas, page_doc)
+            canvas.saveState()
+            canvas.setFillColor(colors.HexColor("#b91c1c"))
+            canvas.setFont("Helvetica-Bold", 19)
+            canvas.translate(A4[0] / 2, A4[1] / 2)
+            canvas.rotate(35)
+            canvas.drawCentredString(0, 0, "Draft: unresolved issues")
+            canvas.restoreState()
+
+        doc.build(flow, onFirstPage=draft_footer, onLaterPages=draft_footer)
+    else:
+        doc.build(flow, onFirstPage=_footer, onLaterPages=_footer)
     logger.info("proposal_pdf_built line_items=%d", len(line_items))
     return buf.getvalue()

@@ -521,9 +521,10 @@ class TestDesignPipelineHelpers:
         }
         option = pipeline._to_option(design, sample_request)
         assert option.title  # coerced to string, non-empty
-        assert len(option.furniture) == 1
-        assert option.furniture[0].estimated_price_inr == 0
-        assert option.furniture[0].quantity == 1
+        sofa = next(item for item in option.furniture if item.name == "Sofa")
+        assert sofa.estimated_price_inr == 0
+        assert sofa.quantity == 1
+        assert any(item.category == "lighting" for item in option.furniture)
 
     def test_to_option_ignores_model_supplied_price(self, pipeline, sample_request):
         """
@@ -539,7 +540,10 @@ class TestDesignPipelineHelpers:
             "title": "T",
             "furniture": [{"name": "Sofa", "estimated_price_inr": 10000, "quantity": 2}],
         }
-        assert pipeline._to_option(design, sample_request).estimated_cost_inr == 0
+        option = pipeline._to_option(design, sample_request)
+        sofa = next(item for item in option.furniture if item.name == "Sofa")
+        assert sofa.estimated_price_inr == 0
+        assert option.estimated_cost_inr == 2_450  # catalog light and NE plant
 
     def test_to_option_prices_from_catalog(self, pipeline, sample_request):
         """A real SKU is priced from the database, ignoring the model's number."""
@@ -551,7 +555,7 @@ class TestDesignPipelineHelpers:
             }],
         }
         option = pipeline._to_option(design, sample_request)
-        assert option.estimated_cost_inr == 37_000  # 18,500 x 2
+        assert option.estimated_cost_inr == 39_450  # sofa plus catalog light and plant
         assert option.furniture[0].sku == "SOF-2S-01"
         assert option.furniture[0].url
 
@@ -583,9 +587,9 @@ class TestDesignPipelineHelpers:
         bunk = option.furniture[0]
         assert bunk.quantity == 1, "one bunk sleeps two; it must not be doubled"
         assert bunk.line_total_inr == bunk.unit_price_inr * bunk.quantity
-        assert option.estimated_cost_inr == 14_500
+        assert option.estimated_cost_inr == 16_300  # bunk plus catalog lighting
 
     def test_to_option_empty_design(self, pipeline, sample_request):
         option = pipeline._to_option({}, sample_request)
         assert option.title
-        assert option.furniture == []
+        assert any(item.category == "lighting" for item in option.furniture)

@@ -98,6 +98,7 @@ class RetrievalService:
                     "rooms": entry.get("rooms", []),
                     "styles": entry.get("styles", []),
                     "budget_tiers": entry.get("budget_tiers", []),
+                    "window_directions": entry.get("window_directions", []),
                     "vastu": bool(entry.get("vastu", False)),
                 },
                 embedding=vectors[i],
@@ -140,6 +141,8 @@ class RetrievalService:
         ]
         if request.room_dimensions:
             parts.append(request.room_dimensions)
+        if request.window_direction:
+            parts.append("window direction " + request.window_direction)
         if request.furniture:
             parts.append("furniture " + " ".join(request.furniture))
         if request.specific_requirements:
@@ -161,6 +164,7 @@ class RetrievalService:
         room: Optional[str] = None,
         style: Optional[str] = None,
         budget_tier: Optional[str] = None,
+        window_direction: Optional[str] = None,
         require_vastu: bool = False,
         pool: Optional[int] = None,
     ) -> List[RetrievedContext]:
@@ -213,7 +217,9 @@ class RetrievalService:
                     continue
                 if not matches_filter(
                     entry, room=room, style=style,
-                    budget_tier=budget_tier, require_vastu=require_vastu,
+                    budget_tier=budget_tier,
+                    window_direction=window_direction,
+                    require_vastu=require_vastu,
                 ):
                     continue
                 picked.append(RetrievedContext(
@@ -225,6 +231,7 @@ class RetrievalService:
                         "rooms": entry.get("rooms", []),
                         "styles": entry.get("styles", []),
                         "budget_tiers": entry.get("budget_tiers", []),
+                        "window_directions": entry.get("window_directions", []),
                         "vastu": bool(entry.get("vastu", False)),
                         # `score` is the fused RRF rank score (top hit ~1/61),
                         # which is not a similarity and must not be presented
@@ -273,6 +280,7 @@ class RetrievalService:
             room=request.room_type.value,
             style=request.style.value,
             budget_tier=request.budget.value,
+            window_direction=request.window_direction,
             require_vastu=request.vastu_compliance.value == "strict",
         )
         query = self.build_query(request)
@@ -286,7 +294,8 @@ class RetrievalService:
         # room and style so a Modern brief cannot gain Japanese-only advice.
         by_room = await self.retrieve(
             query, top_k=target, room=filters["room"],
-            style=filters["style"], pool=pool
+            style=filters["style"],
+            window_direction=filters["window_direction"], pool=pool
         )
         if len(by_room) > len(results):
             results = by_room
@@ -302,6 +311,7 @@ class RetrievalService:
             {**filters, "require_vastu": False, "budget_tier": None},
             {
                 "room": filters["room"], "style": filters["style"],
+                "window_direction": filters["window_direction"],
                 "require_vastu": False,
             },
         ):

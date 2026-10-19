@@ -713,6 +713,76 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
         # vary the unselected accessory mix enough to be visibly distinct.
         if variation_index > 0:
             from app.engine.brief import BRIEF_TO_CATALOG_CATEGORY
+            variation_skus = set()
+            if (
+                brief.room_type == "living_room"
+                and not any("sofa" in value.lower() for value in brief.selected_furniture)
+                and any(
+                    item.get("category") == "seating"
+                    and any(term in item.get("name", "").lower()
+                            for term in ("sofa", "sectional"))
+                    for item in furniture
+                )
+            ):
+                sofa_sku = "SOF-3S-01" if variation_index == 1 else "SOF-SEC-01"
+                sofa = catalog.get(sofa_sku)
+                if sofa is not None:
+                    furniture = [
+                        item for item in furniture
+                        if not (
+                            item.get("category") == "seating"
+                            and any(term in item.get("name", "").lower()
+                                    for term in ("sofa", "sectional"))
+                        )
+                    ]
+                    furniture.append({
+                        "name": sofa.name, "category": sofa.category,
+                        "sku": sofa.sku, "quantity": 1,
+                        "brand_suggestions": [sofa.brand],
+                    })
+
+            if (
+                brief.room_type == "living_room"
+                and variation_index >= 2
+                and not any("coffee table" in value.lower()
+                            for value in brief.selected_furniture)
+            ):
+                current_table_skus = {
+                    item["sku"] for item in furniture if item.get("category") == "table"
+                }
+                coffee_table = catalog.get("TBL-COF-02")
+                if coffee_table is not None and coffee_table.sku not in current_table_skus:
+                    furniture = [
+                        item for item in furniture
+                        if not (item.get("category") == "table"
+                                and "coffee table" in item.get("name", "").lower())
+                    ]
+                    furniture.append({
+                        "name": coffee_table.name, "category": coffee_table.category,
+                        "sku": coffee_table.sku, "quantity": 1,
+                        "brand_suggestions": [coffee_table.brand],
+                    })
+
+            if (
+                brief.room_type == "living_room"
+                and not any(
+                    canonical_item_for(value) in {"bookshelf", "storage"}
+                    or "shoe rack" in value.lower()
+                    for value in brief.selected_furniture
+                )
+            ):
+                storage = catalog.get("STO-CHV-01")
+                if storage is not None:
+                    furniture = [
+                        item for item in furniture
+                        if item.get("category") not in {"storage", "wardrobe"}
+                    ]
+                    furniture.append({
+                        "name": storage.name, "category": storage.category,
+                        "sku": storage.sku, "quantity": 1,
+                        "brand_suggestions": [storage.brand],
+                    })
+                    variation_skus.add(storage.sku)
 
             mandatory_categories = {
                 catalog_category
@@ -733,6 +803,7 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             furniture = [
                 item for item in furniture
                 if item["sku"] in selected_skus
+                or item["sku"] in variation_skus
                 or item["category"] in mandatory_categories
             ]
             current_skus = {item["sku"] for item in furniture}
@@ -803,6 +874,33 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             item["name"] for item in furniture
             if item["category"] in {"decor", "soft"}
         ]
+        palette = _fallback_palette(brief.color_scheme)
+        palette_variants = {
+            "warm": [
+                ["#B85F3B", "#718146", "#963D2C", "#D9CAB8"],
+                ["#C66A42", "#817F3E", "#A54E2F", "#E1CFB6"],
+            ],
+            "earthy": [
+                ["#B85F3B", "#718146", "#963D2C", "#D9CAB8"],
+                ["#C66A42", "#817F3E", "#A54E2F", "#E1CFB6"],
+            ],
+            "neutral": [
+                ["#EAE5DB", "#C8BDAE", "#95A27F", "#F6F2EB"],
+                ["#F0E9DE", "#BFB5A8", "#8D9B7C", "#FAF7F0"],
+            ],
+            "cool": [
+                ["#158C90", "#29486A", "#5AA6D8", "#E4EAF0"],
+                ["#238E9A", "#263D62", "#68A9CF", "#EFF2F5"],
+            ],
+            "pastel": [
+                ["#F2B8C4", "#AFCBE6", "#B4DFCE", "#FFF8F6"],
+                ["#F4C2CC", "#B3D0E8", "#B9E1D4", "#FBF7F4"],
+            ],
+        }
+        if variation_index and palette.get("scheme") in palette_variants:
+            palette["hex_codes"] = palette_variants[palette["scheme"]][
+                min(variation_index - 1, 1)
+            ]
 
         requirement_notes: List[str] = []
         if "kids_safe" in requirements:
@@ -848,7 +946,7 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             ),
             "zones": zones,
             "furniture": furniture,
-            "color_palette": _fallback_palette(brief.color_scheme),
+            "color_palette": palette,
             "lighting_plan": (
                 f"Use the listed {', '.join(lighting_names)} for room lighting."
                 if lighting_names else
@@ -1542,9 +1640,8 @@ class DesignPipeline:
             # (SKU: BED-KID-BUNK-01)". That is an artefact of the prompt, not
             # a product name, and the catalog already knows the real one.
             name = re.sub(r"\s*\(?\s*sku\s*[:=]?\s*[\w-]+\s*\)?\s*$", "", name, flags=re.I)
-            if line["sku"].upper() in name.upper() or not name:
-                item["name"] = line["name"]
-            item["category"] = item.get("category") or line["category"]
+            item["name"] = line["name"]
+            item["category"] = line["category"]
             if not item.get("brand_suggestions"):
                 item["brand_suggestions"] = [line["brand"]]
 
@@ -1572,6 +1669,20 @@ class DesignPipeline:
         # that category and add it. This is the last step, after quantities
         # are settled, so a two-bed brief yields two beds by construction.
         self._insert_missing_required(design, constraints)
+        self._ensure_catalog_accessories(design, constraints)
+        if constraints.room_type == "living_room":
+            all_furniture = [
+                item for item in design.get("furniture", [])
+                if isinstance(item, dict)
+            ]
+            primary = [
+                item["name"] for category in ("seating", "tv_unit", "table")
+                for item in all_furniture if item.get("category") == category
+            ]
+            if primary:
+                design["concept"] = (
+                    "A living room centred on " + ", ".join(primary[:3]) + "."
+                )
         design["_normalized"] = True
 
         return design
@@ -1638,10 +1749,10 @@ class DesignPipeline:
         if not isinstance(furniture, list):
             return
 
-        from app.engine.brief import products_satisfying
-        from app.engine.validator import _count_items
-        from app.engine.validator import _SYNONYM_CATEGORIES
-        from app.engine.brief import canonical_item_for
+        from app.engine.brief import (
+            canonical_item_for, products_satisfying, seats_per_product,
+        )
+        from app.engine.validator import _SYNONYM_CATEGORIES, _count_items
 
         existing_skus = {
             str(item.get("sku", "")).strip().upper()
@@ -1729,6 +1840,354 @@ class DesignPipeline:
                 category, requested, served, product.sku,
             )
             metrics.increment("design.inserted_required_item")
+
+        if constraints.room_type == "living_room" and constraints.seating_capacity:
+            def seated_count() -> int:
+                total = 0
+                for entry in furniture:
+                    if not isinstance(entry, dict):
+                        continue
+                    product = catalog.get(str(entry.get("sku", "")))
+                    if product is None or product.category != "seating":
+                        continue
+                    try:
+                        quantity = max(1, int(float(entry.get("quantity", 1))))
+                    except (TypeError, ValueError):
+                        quantity = 1
+                    total += seats_per_product(product.name) * quantity
+                return total
+
+            while seated_count() < constraints.seating_capacity:
+                deficit = constraints.seating_capacity - seated_count()
+                present = {
+                    str(entry.get("sku", "")).upper()
+                    for entry in furniture if isinstance(entry, dict)
+                }
+                candidates = [
+                    item for item in catalog.for_room("living_room")
+                    if item.category == "seating"
+                    and item.sku not in present
+                    and any(word in item.name.lower() for word in (
+                        "sofa", "sectional", "armchair",
+                    ))
+                ]
+                if not candidates:
+                    break
+                product = min(
+                    candidates,
+                    key=lambda item: (
+                        item.price_inr / seats_per_product(item.name),
+                        abs(seats_per_product(item.name) - deficit),
+                    ),
+                )
+                furniture.append({
+                    "name": product.name,
+                    "category": product.category,
+                    "sku": product.sku,
+                    "quantity": 1,
+                    "brand_suggestions": [product.brand],
+                    "_inserted_by_validator": True,
+                })
+
+    @staticmethod
+    def _ensure_catalog_accessories(
+        design: Dict[str, Any], constraints: BriefConstraints
+    ) -> None:
+        """Add functional lighting and a light north-east accent where needed."""
+        from app.catalog import catalog
+
+        furniture = design.setdefault("furniture", [])
+        if not isinstance(furniture, list):
+            return
+        existing = {
+            str(item.get("sku", "")).upper()
+            for item in furniture if isinstance(item, dict)
+        }
+        skus = ["KIT-LGT-01"] if constraints.room_type == "kitchen" else ["LMP-CEL-01"]
+        prefer_closed = any(
+            phrase in constraints.raw_text.lower()
+            for phrase in ("prefer closed storage", "closed storage preferred")
+        )
+        if prefer_closed:
+            selected = {name.lower() for name in constraints.selected_furniture}
+            furniture[:] = [
+                item for item in furniture
+                if not (
+                    isinstance(item, dict)
+                    and any(word in str(item.get("name", "")).lower()
+                            for word in ("open shelf", "floating wall shelf"))
+                    and not any(
+                        name in str(item.get("name", "")).lower()
+                        or str(item.get("name", "")).lower() in name
+                        for name in selected
+                    )
+                )
+            ]
+            existing = {
+                str(item.get("sku", "")).upper()
+                for item in furniture if isinstance(item, dict)
+            }
+            if not any(
+                isinstance(item, dict)
+                and "closed" in str(item.get("name", "")).lower()
+                for item in furniture
+            ):
+                skus.insert(
+                    0, "KIT-OVC-01"
+                    if constraints.room_type == "kitchen" else "STO-CAB-01"
+                )
+            design["storage_strategy"] = (
+                "Prefer closed storage using the listed enclosed cabinet."
+            )
+        if constraints.room_type == "living_room" and not any(
+            any(word in str(item.get("name", "")).lower() for word in ("lamp", "plant"))
+            for item in furniture if isinstance(item, dict)
+        ):
+            skus.append("DEC-PLT-01")
+
+        for sku in skus:
+            product = catalog.get(sku)
+            if (
+                product is None or sku.upper() in existing
+                or not catalog.allowed_in_room(product, constraints.room_type)
+            ):
+                continue
+            furniture.append({
+                "name": product.name,
+                "category": product.category,
+                "sku": product.sku,
+                "quantity": 1,
+                "brand_suggestions": [product.brand],
+                "_inserted_by_validator": True,
+            })
+            existing.add(sku)
+
+        if constraints.room_type == "living_room":
+            requirements = {
+                str(value).strip().lower().replace("-", "_").replace(" ", "_")
+                for value in constraints.special_requirements
+            }
+            if "entertainment" in requirements and not any(
+                str(item.get("category", "")).lower() == "tv_unit"
+                for item in furniture if isinstance(item, dict)
+            ):
+                product = catalog.get("TVU-WAL-01")
+                if product is not None:
+                    furniture.append({
+                        "name": product.name, "category": product.category,
+                        "sku": product.sku, "quantity": 1,
+                        "brand_suggestions": [product.brand],
+                        "_inserted_by_validator": True,
+                    })
+                    existing.add(product.sku.upper())
+            if ("heavy_storage" in requirements or "storage_heavy" in requirements) and not any(
+                isinstance(item, dict)
+                and item.get("category") in {"storage", "wardrobe"}
+                for item in furniture
+            ):
+                product = catalog.get("STO-CAB-01")
+                if product is not None:
+                    furniture.append({
+                        "name": product.name, "category": product.category,
+                        "sku": product.sku, "quantity": 1,
+                        "brand_suggestions": [product.brand],
+                        "_inserted_by_validator": True,
+                    })
+                    existing.add(product.sku.upper())
+            sentences = []
+            if "kids_safe" in requirements:
+                sentences.append(
+                    "Kids Safe: specify rounded-edge protection, anchor tall units "
+                    "with anti-tip hardware, and avoid glass."
+                )
+            if "low_maintenance" in requirements:
+                sentences.append(
+                    "Low Maintenance: use wipe-clean, durable finishes for daily use."
+                )
+            if "heavy_storage" in requirements or "storage_heavy" in requirements:
+                sentences.append(
+                    "Heavy Storage: use the listed closed storage and anchor tall units."
+                )
+            if "natural_light" in requirements:
+                direction = constraints.window_direction
+                if direction:
+                    sentences.append(
+                        f"Natural Light: keep the {direction}-facing window clear."
+                    )
+                else:
+                    sentences.append("Natural Light: keep the window and its daylight path clear.")
+            if "entertainment" in requirements:
+                sentences.append("Entertainment: orient the viewing area to the listed TV unit.")
+            if sentences:
+                current = str(design.get("layout_description") or "").strip()
+                design["layout_description"] = " ".join([current, *sentences]).strip()
+
+        light_names = [
+            str(item.get("name")) for item in furniture
+            if isinstance(item, dict) and item.get("category") == "lighting"
+        ]
+        if light_names:
+            design["lighting_plan"] = (
+                "Lighting in this option: " + ", ".join(light_names) + "."
+            )
+
+        budget = constraints.budget_inr if constraints.budget_is_exact else None
+        if budget:
+            current_total = sum(
+                (catalog.get(str(item.get("sku", ""))).price_inr
+                 * max(1, int(item.get("quantity", 1) or 1)))
+                for item in furniture if isinstance(item, dict)
+                and catalog.get(str(item.get("sku", ""))) is not None
+            )
+            target = int(budget * 0.70)
+            ceiling = int(budget * 0.95)
+            sofa_selected = any(
+                "sofa" in name.lower() or "sectional" in name.lower()
+                for name in constraints.selected_furniture
+            )
+            if (
+                constraints.room_type == "living_room"
+                and not sofa_selected
+                and "Accessory" not in str(design.get("title", ""))
+            ):
+                sofa_entry = next(
+                    (
+                        item for item in furniture
+                        if isinstance(item, dict)
+                        and item.get("category") == "seating"
+                        and any(term in str(item.get("name", "")).lower()
+                                for term in ("sofa", "sectional"))
+                    ),
+                    None,
+                )
+                if sofa_entry is not None:
+                    current_product = catalog.get(str(sofa_entry.get("sku", "")))
+                    alternatives = [
+                        item for item in catalog.for_room("living_room")
+                        if item.category == "seating"
+                        and any(term in item.name.lower() for term in ("sofa", "sectional"))
+                        and item.price_inr > (current_product.price_inr if current_product else 0)
+                        and current_total
+                            - (current_product.price_inr if current_product else 0)
+                            + item.price_inr <= ceiling
+                    ]
+                    if alternatives and current_product is not None:
+                        upgraded = max(alternatives, key=lambda item: item.price_inr)
+                        sofa_entry.update({
+                            "name": upgraded.name, "category": upgraded.category,
+                            "sku": upgraded.sku,
+                            "brand_suggestions": [upgraded.brand],
+                        })
+                        existing.discard(current_product.sku.upper())
+                        existing.add(upgraded.sku.upper())
+                        current_total += upgraded.price_inr - current_product.price_inr
+            priority = {
+                "table": 0, "storage": 1, "wardrobe": 1,
+                "soft": 2, "decor": 3, "lighting": 4,
+            }
+            candidates = sorted(
+                catalog.for_room(constraints.room_type),
+                key=lambda item: (
+                    priority.get(item.category, 9), -item.price_inr, item.name
+                ),
+            )
+            if constraints.room_type == "kitchen":
+                candidates = [
+                    item for item in candidates
+                    if item.category in {"kitchen", "lighting"}
+                ]
+            if constraints.room_type == "living_room":
+                candidates = [
+                    item for item in candidates
+                    if item.category in {"table", "storage", "soft", "decor"}
+                    if (
+                        item.category != "table"
+                        or any(term in item.name.lower() for term in (
+                            "coffee table", "side table",
+                        ))
+                    )
+                    and (
+                        item.category != "storage"
+                        or any(term in item.name.lower() for term in (
+                            "bookshelf", "shoe rack", "shoe cabinet",
+                            "closed storage", "cube storage",
+                        ))
+                    )
+                    and (
+                        item.category not in {"decor", "soft"}
+                        or any(term in item.name.lower() for term in (
+                            "planter", "plant", "rug", "curtain", "mirror", "wall art",
+                        ))
+                    )
+                ]
+            for product in candidates:
+                if current_total >= target:
+                    break
+                if product.sku.upper() in existing:
+                    continue
+                if current_total + product.price_inr > ceiling:
+                    continue
+                furniture.append({
+                    "name": product.name, "category": product.category,
+                    "sku": product.sku, "quantity": 1,
+                    "brand_suggestions": [product.brand],
+                    "_inserted_by_validator": True,
+                })
+                existing.add(product.sku.upper())
+                current_total += product.price_inr
+            if (
+                constraints.room_type == "living_room"
+                and current_total < target
+                and not sofa_selected
+                and any(
+                    isinstance(item, dict)
+                    and item.get("category") == "seating"
+                    for item in furniture
+                )
+            ):
+                chair = catalog.get("ARM-01")
+                if (
+                    chair is not None
+                    and chair.sku.upper() not in existing
+                    and current_total + chair.price_inr <= ceiling
+                ):
+                    furniture.append({
+                        "name": chair.name, "category": chair.category,
+                        "sku": chair.sku, "quantity": 1,
+                        "brand_suggestions": [chair.brand],
+                        "_inserted_by_validator": True,
+                    })
+                    existing.add(chair.sku.upper())
+                    current_total += chair.price_inr
+
+        storage_names = [
+            str(item.get("name")) for item in furniture
+            if isinstance(item, dict)
+            and item.get("category") in {"storage", "wardrobe"}
+        ]
+        if storage_names and not prefer_closed:
+            design["storage_strategy"] = (
+                "Storage provided by " + ", ".join(storage_names) + "."
+            )
+        elif prefer_closed:
+            closed_names = [
+                str(item.get("name")) for item in furniture
+                if isinstance(item, dict)
+                and (
+                    "closed" in str(item.get("name", "")).lower()
+                    or "cabinet" in str(item.get("name", "")).lower()
+                    or (
+                        constraints.room_type == "kitchen"
+                        and "overhead" in str(item.get("name", "")).lower()
+                    )
+                )
+            ]
+            design["storage_strategy"] = (
+                "Closed storage provided by " + ", ".join(closed_names) + "."
+                if closed_names else
+                f"The catalog has no closed-storage product suited to "
+                f"this {constraints.room_type.replace('_', ' ')}."
+            )
 
     @staticmethod
     def _attach_vastu(design: Dict[str, Any], brief: BriefConstraints) -> None:
@@ -2367,6 +2826,72 @@ class DesignPipeline:
         # reflection loop; the option card must describe the option on it.
         layout = self._layout_for(design, costed, constraints)
         design["layout"] = layout or {}
+        room_name = constraints.room_type.replace("_", " ")
+        primary_names = [
+            str(item.get("name"))
+            for category in ("seating", "tv_unit")
+            for item in design.get("furniture", [])
+            if isinstance(item, dict) and item.get("category") == category
+        ]
+        actual_layout_items = (layout or {}).get("items", [])
+        positions = [
+            f"{item.get('name')} on the {item.get('wall')} wall"
+            for item in actual_layout_items
+            if item.get("category") in {"seating", "tv_unit"} and item.get("wall")
+        ]
+        room_info = (layout or {}).get("room") or {}
+        description_parts = []
+        if room_info.get("dimension_text"):
+            description_parts.append(
+                f"In the {room_info['dimension_text']} {room_name}"
+            )
+        else:
+            description_parts.append(f"In the {room_name}")
+        if primary_names:
+            description_parts.append(
+                "the main pieces are " + ", ".join(primary_names[:3])
+            )
+        if positions:
+            description_parts.append("placed " + " and ".join(positions[:3]))
+        if constraints.door_direction:
+            description_parts.append(f"the door is on the {constraints.door_direction} side")
+        if constraints.window_direction:
+            description_parts.append(f"the window faces {constraints.window_direction}")
+        zones = (layout or {}).get("zones") or []
+        if zones:
+            description_parts.append(
+                "approximate zones: " + "; ".join(
+                    f"{zone.get('label')}: {zone.get('approx_area_sqft')} sq ft"
+                    for zone in zones
+                )
+            )
+        requirements = {
+            str(value).strip().lower().replace("-", "_").replace(" ", "_")
+            for value in constraints.special_requirements
+        }
+        if "kids_safe" in requirements:
+            description_parts.append(
+                "Kids Safe: specify rounded-edge protection, anchor tall units "
+                "with anti-tip hardware, and avoid glass"
+            )
+        if "low_maintenance" in requirements:
+            description_parts.append(
+                "Low Maintenance: use wipe-clean, durable finishes"
+            )
+        if {"heavy_storage", "storage_heavy"} & requirements:
+            description_parts.append(
+                "Heavy Storage: use the listed storage and anchor tall units"
+            )
+        if "natural_light" in requirements:
+            direction = constraints.window_direction or "available"
+            description_parts.append(
+                f"Natural Light: keep the {direction}-facing window clear"
+            )
+        if "entertainment" in requirements:
+            description_parts.append(
+                "Entertainment: orient the viewing area toward the listed TV unit"
+            )
+        design["layout_description"] = ". ".join(description_parts) + "."
         self._attach_vastu(design, constraints)
         report = validate_design(design, constraints, costed)
         for item in design.get("furniture", []) or []:
@@ -2383,9 +2908,8 @@ class DesignPipeline:
                 name = re.sub(
                     r"\s*\(?\s*sku\s*[:=]?\s*[\w-]+\s*\)?\s*$", "", name, flags=re.I
                 )
-                if not name or line["sku"].upper() in name.upper():
-                    item["name"] = line["name"]
-                item["category"] = item.get("category") or line["category"]
+                item["name"] = line["name"]
+                item["category"] = line["category"]
                 if not item.get("brand_suggestions"):
                     item["brand_suggestions"] = [line["brand"]]
 
@@ -2595,6 +3119,15 @@ class DesignPipeline:
                 "depth_cm": dims_cm.get("depth", 0),
                 "height_cm": dims_cm.get("height", 0),
                 "quantity": line.get("quantity", 1),
+                **({
+                    "preferred_walls": ["west", "north"],
+                } if constraints.room_type == "living_room"
+                   and line.get("category") == "tv_unit" else {}),
+                **({
+                    "preferred_corner": "northeast",
+                } if constraints.room_type == "living_room"
+                   and any(word in str(line.get("name", "")).lower()
+                           for word in ("plant", "lamp")) else {}),
             })
         try:
             plan = place_furniture(

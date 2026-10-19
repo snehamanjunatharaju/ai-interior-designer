@@ -521,7 +521,7 @@ class TestSelectedFurniture:
     def test_catalog_mode_returns_two_distinct_options_with_selected_items(self, monkeypatch):
         from app.agents.orchestrator import registry
 
-        monkeypatch.setattr(registry, "all", lambda: {})
+        monkeypatch.setattr(registry, "all", dict)
         request = _request(
             room_type="living_room",
             furniture=["Coffee Table", "Bookshelf", "Shoe Rack"],
@@ -789,4 +789,282 @@ class TestLayoutDimensions:
         assert option.layout["zones"]
         zone = option.layout["zones"][0]
         assert zone["approx_area_sqft"] > 0
-        assert zone["note"].startswith("footprint plus clearance")
+        assert zone["note"].startswith("approximate placed-item footprint")
+
+
+class TestCurrentLivingRoomRequirements:
+    def test_catalog_repair_keeps_selected_items_and_repairs_tv_and_ne_corner(self):
+        request = _request(
+            room_type="living_room",
+            client_preferences="Living room with selected TV Unit",
+            furniture=["TV Unit"],
+            budget_amount_inr=None,
+            num_options=1,
+        )
+        brief = _brief(request)
+        pipeline = DesignPipeline()
+        design = pipeline._normalize_design({
+            "furniture": [{
+                "name": "Study Desk 120cm with Drawer",
+                "category": "desk", "sku": "DSK-STD-01", "quantity": 1,
+            }],
+        }, brief)
+        costing = price_design(design, budget_inr=brief.budget_inr)
+        layout = pipeline._layout_for(design, costing, brief)
+        assert all(item["category"] != "desk" for item in design["furniture"])
+        tv = next(item for item in layout["items"] if item["category"] == "tv_unit")
+        assert tv["wall"] in {"west", "north"}
+        plant = next(item for item in layout["items"] if "plant" in item["name"].lower())
+        assert plant["wall"] == "north"
+        assert plant["x"] + plant["width"] >= layout["room"]["width_cm"] / 2
+        pipeline._attach_vastu(design, brief)
+        report = validate_design(design, brief, costing)
+        assert "missing_items" not in _codes(report)
+        assert "selected_furniture_missing" not in _codes(report)
+
+    def test_living_room_catalog_and_layout_exclude_other_room_products(self):
+        living_products = catalog.for_room("living_room")
+        assert all(catalog.allowed_in_room(item, "living_room") for item in living_products)
+        assert not any(item.category in {"desk", "kitchen", "chair"} for item in living_products)
+        request = _request(room_type="living_room", num_options=1)
+        option = DesignPipeline()._to_option({
+            "furniture": [{
+                "name": "Modular Kitchen Base Unit 3ft",
+                "category": "kitchen", "sku": "KIT-BSE-01", "quantity": 1,
+            }],
+        }, request)
+        assert all(item.category != "kitchen" for item in option.furniture)
+        assert all(item["category"] != "kitchen" for item in option.layout["items"])
+        assert "kitchen" not in option.layout_description.lower()
+
+    def test_catalog_tv_sku_counts_even_with_a_wrong_model_category(self):
+        from app.engine.validator import _count_items
+
+        design = {"furniture": [{
+            "name": "wrong label", "category": "seating",
+            "sku": "TVU-WAL-01", "quantity": 1,
+        }]}
+        assert _count_items(design, {"tv_unit"}, "tv_unit") == 1
+
+    def test_non_kitchen_open_shelf_is_not_required_and_closed_preference_is_applied(self):
+        request = _request(
+            room_type="living_room",
+            client_preferences="Please prefer closed storage.",
+            num_options=1,
+        )
+        brief = _brief(request)
+        assert "kitchen_open_shelf" not in brief.required_items
+        design = DesignPipeline()._normalize_design({
+            "furniture": [{
+                "name": "Floating Wall Shelf 90cm",
+                "category": "storage", "sku": "STO-SHLF-01",
+            }],
+        }, brief)
+        names = [item["name"].lower() for item in design["furniture"]]
+        assert any("closed storage" in name for name in names)
+        assert not any("floating wall shelf" in name for name in names)
+
+    def test_coffee_table_is_catalogued_and_selected_item_is_inserted(self):
+        assert catalog.get("TBL-COF-01") is not None
+        request = _request(
+            room_type="living_room", furniture=["Coffee Table"], num_options=1,
+        )
+        design = DesignPipeline()._normalize_design({"furniture": []}, _brief(request))
+        assert any(item["sku"] == "TBL-COF-01" for item in design["furniture"])
+
+    def test_explicit_seating_capacity_is_parsed_checked_and_repaired(self):
+        request = _request(
+            room_type="living_room",
+            client_preferences="A living room for 5 to 6 people.",
+            budget_amount_inr=None,
+            num_options=1,
+        )
+        brief = _brief(request)
+        assert brief.seating_capacity == 6
+        option = DesignPipeline()._to_option({"furniture": []}, request, brief)
+        from app.engine.brief import seats_per_product
+
+        seats = sum(
+            seats_per_product(item.name) * item.quantity
+            for item in option.furniture if item.category == "seating"
+        )
+        assert seats >= 6
+        assert "seating_capacity" not in {
+            issue["code"] for issue in option.validation["violations"]
+        }
+
+    def test_exact_budget_targets_seventy_to_ninety_five_percent(self):
+        request = _request(
+            room_type="living_room", budget_amount_inr=40000, num_options=1,
+            furniture=[], specific_requirements=[], occupants=[],
+            client_preferences="A living room.",
+        )
+        option = DesignPipeline()._to_option(
+            DesignPipeline().architect._fallback_design(request, {}, _brief(request)),
+            request,
+            _brief(request),
+        )
+        assert 0.70 <= option.estimated_cost_inr / 40000 <= 0.95
+        assert all(
+            (catalog.get(item["sku"]) is not None)
+            and catalog.allowed_in_room(catalog.get(item["sku"]), "living_room")
+            for item in option.budget_suggestions
+        )
+
+    def test_each_option_uses_its_own_vastu_assessment(self):
+        from app.engine.vastu import evaluate_vastu
+
+        request = _request(room_type="living_room", num_options=1)
+        design = DesignPipeline()._normalize_design({
+            "furniture": [{"name": "TV Unit - Wall Mounted 4ft",
+                           "category": "seating", "sku": "TVU-WAL-01"}],
+        }, _brief(request))
+        option = DesignPipeline()._to_option(design, request, _brief(request))
+        assessment = evaluate_vastu(
+            option.layout["items"], "living_room", "north", "northeast", "soft",
+            option.layout["room"]["width_cm"], option.layout["room"]["depth_cm"],
+        )
+        assert option.vastu_score == assessment.score
+        assert option.vastu_results == [result.to_dict() for result in assessment.results]
+
+    def test_zone_area_uses_footprints_and_never_exceeds_room_area(self):
+        request = _request(room_type="living_room", num_options=1)
+        option = DesignPipeline()._to_option({"furniture": []}, request, _brief(request))
+        zones = option.layout["zones"]
+        assert zones
+        assert sum(zone["approx_area_sqft"] for zone in zones) <= (
+            option.layout["room"]["area_sqft"]
+        )
+
+    def test_concept_names_primary_furniture_not_first_accessory(self):
+        request = _request(room_type="living_room", num_options=1)
+        design = DesignPipeline()._normalize_design({
+            "furniture": [
+                {"name": "Planter with Indoor Plant", "category": "decor", "sku": "DEC-PLT-01"},
+                {"name": "TV Unit - Wall Mounted 4ft", "category": "tv_unit", "sku": "TVU-WAL-01"},
+                {"name": "2-Seater Sofa - Fabric", "category": "seating", "sku": "SOF-2S-01"},
+            ],
+        }, _brief(request))
+        assert "Sofa" in design["concept"]
+        assert "TV Unit" in design["concept"]
+        assert "Planter" not in design["concept"]
+
+    def test_soft_category_and_tv_labels_are_friendly(self):
+        from pathlib import Path
+
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+        assert 'if (raw === "soft") return "Rugs & soft furnishings";' in source
+        assert r'.replace(/\bTv\b/g, "TV")' in source
+
+    def test_every_option_gets_catalog_lighting(self):
+        request = _request(room_type="living_room", num_options=1)
+        option = DesignPipeline()._to_option({"furniture": []}, request, _brief(request))
+        assert any(item.category == "lighting" for item in option.furniture)
+        assert "Ceiling Light" in option.lighting_plan
+
+    def test_chair_count_does_not_count_sofas_or_armchairs(self):
+        from app.engine.validator import _count_items
+
+        design = {"furniture": [
+            {"sku": "ARM-01", "category": "seating", "quantity": 1},
+            {"sku": "SOF-2S-01", "category": "seating", "quantity": 1},
+            {"sku": "CHR-OFF-01", "category": "chair", "quantity": 2},
+        ]}
+        assert _count_items(design, {"chair"}, "chair") == 2
+
+    def test_blocking_score_uses_only_displayed_option_validations(self):
+        from pathlib import Path
+
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+        assert "options && options.length" in source
+        assert "options.flatMap((option)" in source
+        assert "option.validation && option.validation.violations" in source
+
+    def test_requested_options_are_distinct_by_products_and_palette(self, monkeypatch):
+        from app.agents.orchestrator import registry
+
+        monkeypatch.setattr(registry, "all", dict)
+        request = _request(
+            room_type="living_room", num_options=2, budget_amount_inr=100000,
+            furniture=[], specific_requirements=[], occupants=[],
+            client_preferences="A living room.",
+        )
+        options = asyncio.run(DesignPipeline()._parallel_options(
+            request, {}, [], _brief(request),
+        ))
+        assert len(options) == 2
+        assert options[0].color_palette.hex_codes != options[1].color_palette.hex_codes
+        assert {item.sku for item in options[0].furniture} != {
+            item.sku for item in options[1].furniture
+        }
+        sofa_names = [
+            next(item.name for item in option.furniture if item.category == "seating")
+            for option in options
+        ]
+        storage_skus = [
+            next(item.sku for item in option.furniture if item.category == "storage")
+            for option in options
+        ]
+        assert sofa_names[0] != sofa_names[1]
+        assert storage_skus[0] != storage_skus[1]
+
+    def test_layout_copy_uses_real_items_directions_and_room_dimensions(self):
+        request = _request(
+            room_type="living_room", door_direction="north",
+            window_direction="south", num_options=1,
+        )
+        option = DesignPipeline()._to_option(
+            {"furniture": [{"name": "TV Unit - Wall Mounted 4ft",
+                            "category": "tv_unit", "sku": "TVU-WAL-01"}]},
+            request,
+        )
+        text = option.layout_description.lower()
+        assert "9.0 x 11.0 ft" in text
+        assert "door is on the north" in text
+        assert "window faces south" in text
+        assert "tv unit" in text
+        assert "under-bed" not in text and "sleeping area" not in text
+
+    def test_retrieval_metadata_filters_room_and_window_direction(self):
+        from app.services.knowledge_metadata import infer_metadata, matches_filter
+
+        meta = infer_metadata(
+            "For a modern living room, keep a south-facing window clear for daylight."
+        )
+        assert matches_filter(meta, room="living_room", window_direction="south")
+        assert not matches_filter(meta, room="living_room", window_direction="north")
+
+    def test_invalid_pdf_has_draft_unresolved_issues_watermark(self):
+        import base64
+        import re
+        import zlib
+        from app.services.proposal import build_proposal_pdf
+
+        pdf = build_proposal_pdf(
+            design={"title": "Draft"},
+            validation={"valid": False, "violations": [{
+                "code": "missing_items", "severity": "error",
+                "message": "Coffee table is missing.",
+            }]},
+        )
+        streams = re.findall(rb"stream\r?\n(.*?)endstream", pdf, re.DOTALL)
+        decoded = []
+        for stream in streams:
+            stream = stream.rstrip(b"\r\n")
+            try:
+                decoded.append(zlib.decompress(stream))
+            except zlib.error:
+                try:
+                    decoded.append(zlib.decompress(
+                        base64.a85decode(stream, adobe=True)
+                    ))
+                except (ValueError, zlib.error):
+                    continue
+        assert any(b"Draft: unresolved issues" in stream for stream in decoded)
+
+    def test_refine_placeholder_is_selected_from_current_design(self):
+        from pathlib import Path
+
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+        assert "input.placeholder = `Change ${names[0]}" in source
+        assert "currentDesign && currentDesign.furniture" in source

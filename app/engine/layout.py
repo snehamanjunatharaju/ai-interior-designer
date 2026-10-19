@@ -55,7 +55,7 @@ WALL_PREFERENCE: Dict[str, Tuple[str, ...]] = {
     "bed": ("south", "east", "west", "north"),
     "wardrobe": ("northwest", "southwest", "west", "east"),
     "desk": ("north", "east"),
-    "tv_unit": ("north", "east", "west"),
+    "tv_unit": ("west", "north"),
     "bookshelf": ("north", "east", "west", "south"),
     "storage": ("northwest", "south", "east", "west"),
     "seating": ("south", "west", "east"),
@@ -194,26 +194,34 @@ class RoomPlan:
 def zone_sizes(plan: RoomPlan) -> List[Dict[str, Any]]:
     """Approximate size of each functional zone, in feet.
 
-    A zone is the footprint of one category's furniture plus the clearance in
-    front of it. This is an estimate and is labelled as one: it answers "how
-    big is the study corner?" from the plan that was actually drawn, rather
-    than inventing an area the furniture does not occupy.
+    Zones use the bounding footprint of the placed items. If those category
+    bounds overlap, their displayed areas are proportionally capped at the
+    actual room floor area.
     """
     by_category: Dict[str, List[PlacedItem]] = {}
     for item in plan.items:
         by_category.setdefault(item.category, []).append(item)
 
     zones: List[Dict[str, Any]] = []
+    bounds = []
     for category, items in sorted(by_category.items()):
         min_x = min(i.x for i in items)
         min_y = min(i.y for i in items)
         max_x = max(i.right for i in items)
         max_y = max(i.bottom for i in items)
-        # Add the standing clearance in front of the furniture. The room's
-        # own edge already offers a visual margin, so the estimate is capped
-        # by the floor area rather than extending past the walls.
-        width_cm = min(max_x - min_x + MIN_CLEARANCE_CM, plan.width_cm)
-        depth_cm = min(max_y - min_y + MIN_CLEARANCE_CM, plan.depth_cm)
+        width_cm = min(max_x - min_x, plan.width_cm)
+        depth_cm = min(max_y - min_y, plan.depth_cm)
+        bounds.append((category, items, width_cm, depth_cm))
+
+    room_area_sqft = (plan.width_cm / 30.48) * (plan.depth_cm / 30.48)
+    raw_area_sqft = sum(
+        (width / 30.48) * (depth / 30.48)
+        for _, _, width, depth in bounds
+    )
+    scale = min(1.0, math.sqrt(room_area_sqft / raw_area_sqft)) if raw_area_sqft else 1.0
+    for category, items, width_cm, depth_cm in bounds:
+        width_cm *= scale
+        depth_cm *= scale
         zones.append({
             "category": category,
             "label": (
@@ -224,8 +232,16 @@ def zone_sizes(plan: RoomPlan) -> List[Dict[str, Any]]:
             "approx_width_ft": round(width_cm / 30.48, 1),
             "approx_depth_ft": round(depth_cm / 30.48, 1),
             "approx_area_sqft": round((width_cm / 30.48) * (depth_cm / 30.48), 1),
-            "note": "footprint plus clearance, estimated from the plan",
+            "note": "approximate placed-item footprint, capped to room area",
         })
+    display_area = sum(zone["approx_area_sqft"] for zone in zones)
+    area_limit = math.floor(room_area_sqft * 10) / 10
+    if zones and display_area > area_limit:
+        excess = display_area - area_limit
+        last = zones[-1]
+        last["approx_area_sqft"] = max(
+            0.0, math.floor((last["approx_area_sqft"] - excess) * 10) / 10
+        )
     return zones
 
 
@@ -414,6 +430,9 @@ def place_furniture(
         d = float(entry.get("depth_cm", 0) or 0)
         h = float(entry.get("height_cm", 0) or 0)
         qty = max(1, int(entry.get("quantity", 1) or 1))
+        preferred_wall = str(entry.get("preferred_wall") or "")
+        preferred_walls = entry.get("preferred_walls")
+        preferred_corner = str(entry.get("preferred_corner") or "")
 
         if w <= 0 or d <= 0:
             plan.unplaced.append({
@@ -425,7 +444,12 @@ def place_furniture(
         # Place `qty` copies, each individually.
         placed_any = False
         for copy in range(qty):
-            result = _place_one(plan, sku, name, category, w, d, h, zone, window)
+            result = _place_one(
+                plan, sku, name, category, w, d, h, zone, window,
+                preferred_wall=preferred_wall,
+                preferred_walls=preferred_walls,
+                preferred_corner=preferred_corner,
+            )
             if result is None:
                 plan.unplaced.append({
                     "sku": sku,
@@ -449,6 +473,9 @@ def _place_one(
     w: float, d: float, h: float,
     zone: Optional[Tuple[float, float, float]],
     window: Optional[Tuple[float, float, float]],
+    preferred_wall: str = "",
+    preferred_walls: Optional[List[str]] = None,
+    preferred_corner: str = "",
 ) -> Optional[PlacedItem]:
     """
     Find the first position where one item fits with proper clearance.
@@ -457,8 +484,24 @@ def _place_one(
     the natural orientation then the rotated one, scanning along the wall in
     5 cm steps. Returns None if nothing fits.
     """
-    preferred = WALL_PREFERENCE.get(category, ())
-    walls = list(preferred) + [w for w in ("north", "east", "south", "west") if w not in preferred]
+    if preferred_corner == "northeast" and w <= plan.width_cm and d <= plan.depth_cm:
+        corner_item = PlacedItem(
+            sku, name, category, "north", plan.width_cm - w, 0.0, w, d, h
+        )
+        if _fits(corner_item, plan, zone, window, h):
+            return corner_item
+
+    preferred = (
+        [preferred_wall] if preferred_wall else
+        [wall for wall in (preferred_walls or ()) if wall]
+        if preferred_walls else list(WALL_PREFERENCE.get(category, ()))
+    )
+    walls = list(preferred) + [
+        wall for wall in ("north", "east", "south", "west")
+        if wall not in preferred
+    ]
+    if preferred_walls:
+        walls = list(preferred_walls)
 
     for wall in walls:
         for rotated in (False, True):
@@ -505,6 +548,8 @@ def _fits(
 
     # 2. No collision.
     for other in plan.items:
+        if item.category == "soft" or other.category == "soft":
+            continue
         if rectangles_overlap(item, other):
             return False
 
@@ -523,6 +568,8 @@ def _fits(
 
     # 5. Circulation clearance from every other item.
     for other in plan.items:
+        if item.category == "soft" or other.category == "soft":
+            continue
         gap = _min_gap(item, other)
         if gap < MIN_CLEARANCE_CM:
             return False

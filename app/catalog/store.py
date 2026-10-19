@@ -368,6 +368,18 @@ class Catalog:
             return any(term in name for term in (
                 "shoe rack", "shoe cabinet", "shoe storage",
             ))
+        name = item.name.lower()
+        if room != "kids_room" and item.audience == "kids":
+            return False
+        if room == "living_room" and any(term in name for term in (
+            "study", "desk", "office", "bedside", "night lamp", "toy",
+            "dining table", "laundry hamper", "kids",
+        )):
+            return False
+        if item.category == "lighting" and room in {
+            "living_room", "bedroom", "dining", "balcony", "entrance",
+        } and any(term in name for term in ("desk", "night", "under-cabinet")):
+            return False
         rooms = CATEGORY_ROOMS.get(item.category)
         return not rooms or room in rooms
 

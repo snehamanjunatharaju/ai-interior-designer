@@ -45,7 +45,7 @@ ITEM_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "bed": ("bed", "cot", "bunk", "bedstead", "crib"),
     "mattress": ("mattress", "mat"),
     "desk": ("desk", "study table", "workstation"),
-    "chair": ("chair", "stool", "seating"),
+    "chair": ("chair", "dining chair", "armchair"),
     "wardrobe": ("wardrobe", "closet", "almirah", "almirah"),
     "bookshelf": ("bookshelf", "book shelf", "shelf", "bookcase", "shelving"),
     "sofa": ("sofa", "couch", "settee"),
@@ -57,7 +57,7 @@ ITEM_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "curtain": ("curtain", "curtains", "drape", "blinds"),
     "mirror": ("mirror",),
     "storage": ("storage", "chest", "hamper", "stool"),
-    "table": ("table", "side table", "coffee table"),
+    "table": ("coffee table", "side table", "table"),
     "lighting": ("lamp", "light", "lighting"),
     "paint": ("paint", "wall colour", "wall color", "paint the wall"),
     # Kitchen vocabulary. Without these, a kitchen brief asking for cabinets
@@ -146,7 +146,7 @@ BRIEF_TO_CATALOG_CATEGORY: Dict[str, Tuple[str, ...]] = {
     "sofa": ("seating",),
     "armchair": ("seating",),
     "beanbag": ("seating",),
-    "chair": ("chair", "seating"),
+    "chair": ("chair",),
     "bookshelf": ("storage",),
     "storage": ("storage",),
     "tv_unit": ("tv_unit",),
@@ -353,6 +353,8 @@ def mentions_item(text: str, item: str) -> bool:
         for match in re.finditer(rf"\b{re.escape(syn)}s?\b", lower):
             start = max(0, match.start() - 20)
             context = lower[start:match.start()]
+            if item == "lighting" and re.search(r"\b(?:natural|day)\s+$", context):
+                continue
             if not any(neg in context for neg in NEGATIONS):
                 return True
     return False
@@ -751,6 +753,42 @@ def infer_counts_from_occupants(bc: "BriefConstraints") -> None:
         bc.required_items.setdefault("bed", people)
 
 
+def infer_seating_capacity(
+    bc: "BriefConstraints", explicit_text: Optional[str] = None
+) -> None:
+    """Capture the highest explicit living-room seat count in the brief."""
+    if bc.room_type != "living_room":
+        return
+    text = (explicit_text if explicit_text is not None else bc.raw_text).lower()
+    for occupant in bc.occupants:
+        if re.search(r"\b(?:seating|seats?|people|persons?|occupants?)\b", occupant, re.I):
+            text += " " + occupant.lower()
+    capacities: List[int] = []
+    labels = r"(?:people|persons?|occupants?|adults?|children|kids?|guests?|seats?)"
+    for match in re.finditer(rf"\b(\d+)\s*(?:-|to)\s*(\d+)\s+{labels}\b", text):
+        capacities.append(int(match.group(2)))
+    if capacities:
+        bc.seating_capacity = max(capacities)
+        return
+    for match in re.finditer(rf"\b(\d+)\s+{labels}\b", text):
+        capacities.append(int(match.group(1)))
+    for match in re.finditer(rf"\b(?:seats?|accommodates?|for)\s+(\d+)\b", text):
+        capacities.append(int(match.group(1)))
+    if capacities:
+        bc.seating_capacity = max(capacities)
+
+
+def seats_per_product(name: str) -> int:
+    """Estimate fixed seating capacity from a catalog product name."""
+    text = (name or "").lower()
+    match = re.search(r"\b([2-9])\s*[- ]?seater\b|\b([2-9])\s*[- ]?seat\b", text)
+    if match:
+        return int(match.group(1) or match.group(2))
+    if "sectional" in text:
+        return 4
+    return 1
+
+
 @dataclass
 class BriefConstraints:
     """
@@ -769,6 +807,7 @@ class BriefConstraints:
     # the palette is keyed on. `color_scheme` is the canonical token.
     form_color_scheme: str = ""
     budget_inr: Optional[int] = None
+    budget_is_exact: bool = False
     dimensions: RoomDimensions = field(default_factory=RoomDimensions)
     vastu_compliance: str = "soft"
 
@@ -786,6 +825,7 @@ class BriefConstraints:
     window_direction: Optional[str] = None
     # Number of people the room must serve, inferred from the brief.
     occupant_count: Optional[int] = None
+    seating_capacity: Optional[int] = None
     # The form's special-requirement chips, in their submitted form
     # ("kids_safe", "storage_heavy", ...). Kept verbatim so the validator can
     # say "Kids Safe was selected but not addressed" in the client's own terms.
@@ -812,6 +852,7 @@ class BriefConstraints:
             "color_scheme": self.color_scheme,
             "form_color_scheme": self.form_color_scheme,
             "budget_inr": self.budget_inr,
+            "budget_is_exact": self.budget_is_exact,
             "dimensions": self.dimensions.to_dict(),
             "vastu_compliance": self.vastu_compliance,
             "required_items": dict(self.required_items),
@@ -821,6 +862,7 @@ class BriefConstraints:
             "door_direction": self.door_direction,
             "window_direction": self.window_direction,
             "occupant_count": self.occupant_count,
+            "seating_capacity": self.seating_capacity,
             "occupants": list(self.occupants),
             "audience": self.audience,
             "requires_workstation": self.requires_workstation,
@@ -884,7 +926,9 @@ def parse_brief(
     )
 
     # -- money: explicit field wins, then prose --------------------------
-    bc.budget_inr = budget_inr if budget_inr else parse_money(text)
+    parsed_budget = parse_money(text)
+    bc.budget_inr = budget_inr if budget_inr else parsed_budget
+    bc.budget_is_exact = bool(budget_inr or parsed_budget)
 
     # -- colour: explicit select wins, else infer ------------------------
     # The select is what the user picked; prose only fills in when the select
@@ -970,6 +1014,21 @@ def parse_brief(
 
     # Last: infer a bed per occupant where the brief implies it.
     infer_counts_from_occupants(bc)
+    infer_seating_capacity(
+        bc,
+        " ".join(
+            [client_preferences or "", *furniture, *specific_requirements,
+             room_dimensions or "", lifestyle_notes or ""]
+        ),
+    )
+
+    # Kitchen shelving is a room-specific choice; do not turn a phrase such
+    # as "open shelf" in another room into a kitchen product requirement.
+    if bc.room_type != "kitchen":
+        bc.required_items.pop("kitchen_open_shelf", None)
+        bc.optional_items = [
+            item for item in bc.optional_items if item != "kitchen_open_shelf"
+        ]
 
     # A kitchen has a non-negotiable working set: storage above the counter,
     # a vent for Indian cooking, and light over the work surface. The review
