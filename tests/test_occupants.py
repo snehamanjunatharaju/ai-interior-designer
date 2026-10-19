@@ -76,11 +76,9 @@ class TestInferAudience:
         assert infer_audience([], "a master bedroom for a couple") == ADULT
         assert infer_audience([], "a nursery for a toddler") == KIDS
 
-    def test_adults_win_a_tie(self):
-        """
-        A room described for adults and guests must not receive a toddler bed.
-        """
-        assert infer_audience(["adults", "child"], "shared family room") == ADULT
+    def test_child_in_mixed_occupants_makes_child_safe_items_eligible(self):
+        assert infer_audience(["2 adults", "10-year-old child"]) == KIDS
+        assert infer_audience(["adults", "child"], "shared family room") == KIDS
 
     def test_unstated_allows_everything(self):
         """No guess, no filtering - a missing occupant list must not reject."""

@@ -216,7 +216,10 @@ def zone_sizes(plan: RoomPlan) -> List[Dict[str, Any]]:
         depth_cm = min(max_y - min_y + MIN_CLEARANCE_CM, plan.depth_cm)
         zones.append({
             "category": category,
-            "label": category.replace("_", " ").title(),
+            "label": (
+                "TV Unit" if category == "tv_unit"
+                else category.replace("_", " ").title()
+            ),
             "items": [i.name for i in items],
             "approx_width_ft": round(width_cm / 30.48, 1),
             "approx_depth_ft": round(depth_cm / 30.48, 1),

@@ -132,6 +132,36 @@ class TestVastu:
         json.dumps(d)
         assert set(d) >= {"score", "grade", "results", "notes"}
 
+    def test_living_room_rules_cover_tv_seating_and_northeast_corner(self):
+        items = [
+            {"name": "Sofa", "category": "seating", "wall": "south",
+             "x": 0, "y": 280, "width": 180, "depth": 80, "height": 80},
+            {"name": "TV Unit", "category": "tv_unit", "wall": "west",
+             "x": 0, "y": 0, "width": 100, "depth": 30, "height": 60},
+        ]
+        report = evaluate_vastu(
+            items, "living_room", "south", "north", "strict",
+            room_width_cm=305, room_depth_cm=366,
+        )
+        by_code = {result.rule.code: result for result in report.results}
+        assert by_code["tv_west_or_north"].passed
+        assert by_code["seating_faces_north_or_east"].passed
+        assert by_code["heavy_seating_south_or_west"].passed
+        assert by_code["northeast_corner_light"].passed
+
+    def test_living_room_rejects_heavy_northeast_and_west_facing_seating(self):
+        items = [
+            {"name": "Sofa", "category": "seating", "wall": "east",
+             "x": 200, "y": 0, "width": 90, "depth": 80, "height": 80},
+        ]
+        report = evaluate_vastu(
+            items, "living_room", room_width_cm=305, room_depth_cm=366,
+        )
+        by_code = {result.rule.code: result for result in report.results}
+        assert not by_code["seating_faces_north_or_east"].passed
+        assert not by_code["heavy_seating_south_or_west"].passed
+        assert not by_code["northeast_corner_light"].passed
+
 
 # --------------------------------------------------------------------------
 # Refinement

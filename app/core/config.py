@@ -77,6 +77,8 @@ class Settings:
     API_KEY: Optional[str] = _env("API_KEY", "") or None
     RATE_LIMIT_REQUESTS: int = _env_int("RATE_LIMIT_REQUESTS", 60)
     RATE_LIMIT_WINDOW_SECONDS: int = _env_int("RATE_LIMIT_WINDOW_SECONDS", 60)
+    # Rolling per-IP ceiling for public deployments. In-memory and per process.
+    DAILY_LIMIT_REQUESTS: int = _env_int("DAILY_LIMIT_REQUESTS", 100)
 
     # --- LLM providers (ordered by preference; first healthy one wins) ---
     LLM_PROVIDERS: List[str] = _env_list(

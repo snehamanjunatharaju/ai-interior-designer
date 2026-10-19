@@ -30,7 +30,7 @@ from app.core.observability import get_logger, metrics
 logger = get_logger(__name__)
 
 # Bumping this forces a rebuild of the embedded database on next access.
-CATALOG_VERSION = "2026-10-19"
+CATALOG_VERSION = "2026-10-20"
 
 # Cost classes used by the budget negotiator. Lower tier = buy first.
 TIER_ESSENTIAL = "essential"
@@ -353,8 +353,7 @@ class Catalog:
             return self.all()
         return [
             i for i in self._items.values()
-            if not CATEGORY_ROOMS.get(i.category)
-            or room in CATEGORY_ROOMS[i.category]
+            if self.allowed_in_room(i, room)
         ]
 
     def allowed_in_room(self, item: CatalogItem, room_type: str) -> bool:
@@ -364,6 +363,11 @@ class Catalog:
         room = (room_type or "").strip().lower()
         if not room:
             return True
+        if room == "entrance" and item.category == "storage":
+            name = item.name.lower()
+            return any(term in name for term in (
+                "shoe rack", "shoe cabinet", "shoe storage",
+            ))
         rooms = CATEGORY_ROOMS.get(item.category)
         return not rooms or room in rooms
 

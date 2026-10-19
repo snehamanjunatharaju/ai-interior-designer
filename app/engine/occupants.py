@@ -13,10 +13,10 @@ now carries an `audience` column (`adult` / `kids` / `any`) and this module
 reads the brief's occupants into a single audience decision that the optimizer,
 the validator and the validator's exclusion list all consult.
 
-The rule is deliberately conservative. "adults" wins over "kids" when a brief
-mentions both - a family room still cannot have a bunk bed as its only bed -
-and an unstated audience allows everything, because filtering on a guess would
-reject legitimate designs.
+The rule is deliberately conservative: any child among the occupants makes
+child-specific products eligible, while adult-only rooms exclude them. An
+unstated audience allows everything, because filtering on a guess would reject
+legitimate designs.
 """
 
 from __future__ import annotations
@@ -36,7 +36,8 @@ _ADULT_TERMS = re.compile(
 )
 _KIDS_TERMS = re.compile(
     r"\b(kid|kids|child|children|toddler|toddlers|baby|babies|infant|"
-    r"teen|teens|teenager|student|students|school|playroom|nursery)\b",
+    r"teen|teens|teenager|student|students|school|playroom|nursery)\b|"
+    r"\b\d{1,2}\s*[- ]?\s*(?:year|yr)s?[- ]?old\b",
     re.I,
 )
 
@@ -56,17 +57,14 @@ def infer_audience(
     """
     Decide whether this room serves adults, kids, or is unstated.
 
-    Adults win a tie. A room described as "for adults and guests" should not
-    receive a toddler bed, and a "parents' room" is an adult room even when
-    children are mentioned in passing.
+    Any child occupant wins a mixed-audience tie so child-specific safety
+    products are not incorrectly excluded from family rooms.
     """
     blob = " ".join([*(occupants or []), free_text or ""])
 
     has_adults = bool(_ADULT_TERMS.search(blob))
     has_kids = bool(_KIDS_TERMS.search(blob))
 
-    if has_adults and has_kids:
-        return ADULT
     if has_kids:
         return KIDS
     if has_adults:

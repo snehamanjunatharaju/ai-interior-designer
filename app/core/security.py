@@ -116,6 +116,10 @@ limiter = RateLimiter(
     max_requests=settings.RATE_LIMIT_REQUESTS,
     window_seconds=settings.RATE_LIMIT_WINDOW_SECONDS,
 )
+daily_limiter = RateLimiter(
+    max_requests=settings.DAILY_LIMIT_REQUESTS,
+    window_seconds=24 * 60 * 60,
+)
 
 
 async def rate_limit(request: Request) -> None:
@@ -128,5 +132,14 @@ async def rate_limit(request: Request) -> None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded. Please retry shortly.",
+            headers={"Retry-After": str(info)},
+        )
+
+    allowed, info = daily_limiter.check(client_ip)
+    if not allowed:
+        logger.warning("daily_rate_limited ip=%s", client_ip)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Daily request limit reached. Please try again later.",
             headers={"Retry-After": str(info)},
         )

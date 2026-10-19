@@ -282,10 +282,11 @@ class RetrievalService:
         if len(results) >= min(target, settings.RAG_MIN_PASSAGES):
             return results
 
-        # A genuinely relevant passage for this room outranks a generic one,
-        # so a room match is tried without the style and budget tags first.
+        # Relax budget and Vastu constraints first, but preserve the selected
+        # room and style so a Modern brief cannot gain Japanese-only advice.
         by_room = await self.retrieve(
-            query, top_k=target, room=filters["room"], pool=pool
+            query, top_k=target, room=filters["room"],
+            style=filters["style"], pool=pool
         )
         if len(by_room) > len(results):
             results = by_room
@@ -293,17 +294,16 @@ class RetrievalService:
             return results
 
         picked_content = {c.content for c in results}
-        # Relax the most restrictive filters first, one at a time. The earlier
-        # version relaxed style before budget, and a kitchen brief whose style
-        # matched nothing left the room filter in place until the last
-        # fallback - which is why it came back with two passages, neither
-        # about kitchens. Budget is the least important filter for grounding.
+        # Relax Vastu and budget in sequence, while keeping room and style
+        # constraints. General untagged advice remains eligible through the
+        # metadata filter without admitting passages tagged for another style.
         for relaxed in (
             {**filters, "require_vastu": False},
             {**filters, "require_vastu": False, "budget_tier": None},
-            {**filters, "budget_tier": None, "style": None},
-            {**filters, "require_vastu": False, "budget_tier": None, "style": None},
-            {},
+            {
+                "room": filters["room"], "style": filters["style"],
+                "require_vastu": False,
+            },
         ):
             extra = await self.retrieve(query, top_k=target, **relaxed, pool=pool)
             for ctx in extra:

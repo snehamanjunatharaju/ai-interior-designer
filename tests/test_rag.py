@@ -156,6 +156,23 @@ class TestRetrieval:
         contexts = await retrieval_service.retrieve_for_request(req, top_k=3)
         assert any("kitchen" in c.content.lower() for c in contexts)
 
+    @pytest.mark.asyncio
+    async def test_modern_brief_excludes_japanese_only_guidance(self):
+        from app.core.schemas import DesignRequest
+        from app.services.retrieval import retrieval_service
+
+        retrieval_service.initialize()
+        req = DesignRequest(
+            room_type="living_room", style="modern",
+            client_preferences="A modern living room with clean lines.",
+        )
+        contexts = await retrieval_service.retrieve_for_request(req)
+        assert 3 <= len(contexts) <= 5
+        assert all(
+            context.source != "Japanese interiors"
+            for context in contexts
+        )
+
     def test_knowledge_base_is_wellformed(self):
         kb = get_knowledge_base()
         assert len(kb) >= 15

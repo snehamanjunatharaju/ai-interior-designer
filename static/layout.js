@@ -363,7 +363,10 @@
       dot.style.background = st.fill;
       dot.style.borderColor = st.stroke;
       chip.appendChild(dot);
-      chip.appendChild(document.createTextNode(c.replace(/_/g, " ")));
+      const label = c.replace(/_/g, " ").replace(/\b[a-z]/g, function (letter) {
+        return letter.toUpperCase();
+      }).replace(/\bTv\b/g, "TV");
+      chip.appendChild(document.createTextNode(label));
       wrap.appendChild(chip);
     });
     return wrap;

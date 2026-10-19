@@ -13,5 +13,7 @@ services:
         value: production
       - key: DEBUG
         value: "false"
+      - key: DAILY_LIMIT_REQUESTS
+        value: "100"
       - key: LLM_PROVIDERS
         value: openai,anthropic

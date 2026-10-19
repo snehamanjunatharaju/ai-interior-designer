@@ -209,6 +209,7 @@ class TestStructuredBrief:
         assert obj["window_direction"] == "northeast"
         assert obj["special_requirements"] == ["kids_safe", "storage_heavy"]
         assert obj["dimensions"]["width_ft"] == 11
+        assert _brief(request).selected_furniture == ["wardrobe"]
 
     def test_validator_does_not_say_directions_were_not_supplied(self):
         brief = _brief(_request())
@@ -388,6 +389,12 @@ class TestCatalogFiltering:
         assert shelf is not None
         assert catalog.allowed_in_room(shelf, "kitchen")
 
+    def test_entrance_allows_shoe_storage_but_not_other_storage(self):
+        entrance_skus = {item.sku for item in catalog.for_room("entrance")}
+        assert "SHR-ITSY-3T-01" in entrance_skus
+        assert "STO-SHLF-01" not in entrance_skus
+        assert "CHV-STO-01" not in entrance_skus
+
     def test_wrong_room_item_is_dropped_and_duplicate_merged(self):
         brief = _brief(_request())
         design = _kitchen(furniture=[
@@ -431,7 +438,7 @@ class TestSpecialRequirements:
         brief = _brief(_request(specific_requirements=["kids_safe"]))
         design = _kitchen(
             layout_description=(
-                "Counter on the south-east. Chairs are rounded, drawers have child "
+                "Counter on the south-east. Chairs have rounded edges, drawers have child "
                 "locks, and every tall unit is anchored to the wall."
             ),
         )
@@ -440,8 +447,120 @@ class TestSpecialRequirements:
 
     def test_storage_heavy_is_recognised(self):
         brief = _brief(_request(specific_requirements=["storage_heavy"]))
-        report = validate_design(_kitchen(), brief, price_design(_kitchen()))
+        design = _kitchen(
+            furniture=[
+                {"name": "Bookshelf 3-Tier - 60cm", "category": "storage",
+                 "sku": "SHV-BOOK-01", "quantity": 1},
+            ],
+            storage_strategy="The heavy storage plan uses the anchored bookshelf.",
+        )
+        report = validate_design(design, brief, price_design(design))
         assert "requirement_not_addressed" not in _codes(report)
+
+    @pytest.mark.parametrize(
+        ("requirement", "text", "furniture"),
+        [
+            ("low_maintenance", "Wipe-clean laminate fronts simplify upkeep.", []),
+            ("natural_light", "Use daylight from the northeast window.", []),
+            ("entertainment", "The entertainment area centres on the television.", [
+                {"name": "TV Unit - Wall Mounted 4ft", "category": "tv_unit",
+                 "sku": "TVU-WAL-01", "quantity": 1},
+            ]),
+        ],
+    )
+    def test_each_special_requirement_has_a_specific_validator_rule(
+        self, requirement, text, furniture
+    ):
+        brief = _brief(_request(
+            specific_requirements=[requirement],
+            window_direction="northeast",
+        ))
+        design = _kitchen(layout_description=text, furniture=furniture)
+        report = validate_design(design, brief, price_design(design))
+        assert "requirement_not_addressed" not in _codes(report)
+
+
+class TestSelectedFurniture:
+    def test_selected_products_must_appear_in_shopping_list(self):
+        request = _request(
+            room_type="living_room",
+            furniture=["Coffee Table", "Bookshelf", "Shoe Rack"],
+            client_preferences="A living room.",
+            vastu_compliance="soft",
+        )
+        brief = _brief(request)
+        design = {
+            "furniture": [
+                {"name": "Coffee Table - Sheesham", "category": "table",
+                 "sku": "TBL-COF-01", "quantity": 1},
+                {"name": "Bookshelf 3-Tier - 60cm", "category": "storage",
+                 "sku": "SHV-BOOK-01", "quantity": 1},
+                {"name": "Nilkamal Itsy 3-Tier Shoe Rack", "category": "storage",
+                 "sku": "SHR-ITSY-3T-01", "quantity": 1},
+            ]
+        }
+        report = validate_design(design, brief, price_design(design))
+        assert "selected_furniture_missing" not in _codes(report)
+
+    def test_missing_selected_product_is_blocking(self):
+        request = _request(
+            room_type="living_room",
+            furniture=["Coffee Table", "Bookshelf"],
+            client_preferences="A living room.",
+            vastu_compliance="soft",
+        )
+        report = validate_design(
+            {"furniture": [{"name": "Side Table - Round 40cm",
+                            "category": "table", "sku": "TBL-SID-01"}]},
+            _brief(request),
+            price_design({"furniture": [{"name": "Side Table - Round 40cm",
+                                         "category": "table", "sku": "TBL-SID-01"}]}),
+        )
+        assert "selected_furniture_missing" in _codes(report)
+
+    def test_catalog_mode_returns_two_distinct_options_with_selected_items(self, monkeypatch):
+        from app.agents.orchestrator import registry
+
+        monkeypatch.setattr(registry, "all", lambda: {})
+        request = _request(
+            room_type="living_room",
+            furniture=["Coffee Table", "Bookshelf", "Shoe Rack"],
+            specific_requirements=[
+                "Kids Safe", "Heavy Storage", "Low Maintenance",
+                "Natural Light", "Entertainment",
+            ],
+            occupants=["2 adults", "10-year-old"],
+            client_preferences="A modern family living room.",
+            budget_amount_inr=40000,
+            num_options=2,
+            vastu_compliance="soft",
+            window_direction="north",
+        )
+        pipeline = DesignPipeline()
+        options = asyncio.run(
+            pipeline._parallel_options(
+                request, {"zones": []}, [], _brief(request)
+            )
+        )
+        assert len(options) == 2
+        sku_sets = [{item.sku for item in option.furniture} for option in options]
+        assert sku_sets[0] != sku_sets[1]
+        for option in options:
+            names = {item.name.lower() for item in option.furniture}
+            assert any("coffee table" in name for name in names)
+            assert any("bookshelf" in name for name in names)
+            assert any("shoe rack" in name for name in names)
+            assert not any(
+                term in name for name in names
+                for term in ("study desk", "study table", "bean bag", "sofa")
+            )
+            assert option.validation["valid"]
+            assert option.estimated_cost_inr == sum(
+                row["line_total_inr"] for row in option.shopping_list
+            )
+            assert option.remaining_budget_inr == 40000 - option.estimated_cost_inr
+            purchased = {row["sku"] for row in option.shopping_list}
+            assert all(item["sku"] not in purchased for item in option.budget_suggestions)
 
 
 # --------------------------------------------------------------------------
@@ -621,15 +740,15 @@ class TestUiContract:
         assert option.validation is not None
         assert "valid" in option.validation
 
-    def test_blocking_issue_is_visible_on_the_option(self):
+    def test_wrong_room_item_is_removed_before_option_is_shown(self):
         request = _request(num_options=1)
         broken = _kitchen(furniture=[
             {"name": "Bean Bag - Large", "sku": "BEAN-01", "category": "seating"},
         ])
         option = DesignPipeline()._to_option(broken, request)
-        codes = {v["code"] for v in option.validation["violations"]
-                 if v["severity"] == "error"}
-        assert codes, "a design with a bean bag in a kitchen must fail"
+        names = {item.name for item in option.furniture}
+        assert "Bean Bag - Large" not in names
+        assert option.validation["valid"]
 
     def test_critic_field_is_remaining_issues(self):
         from app.agents.orchestrator import CriticAgent

@@ -605,20 +605,13 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
     def _fallback_design(
         self, request: DesignRequest, plan: Dict[str, Any],
         brief: Optional[BriefConstraints] = None,
+        variation_index: int = 0,
     ) -> Dict[str, Any]:
         """
-        Build a usable design entirely from the catalog, with no LLM involved.
-
-        This is the recovery path when the model fails or returns unusable
-        JSON. The previous version returned a stub with an empty `furniture`
-        list, which meant the whole request produced a Rs 0 design that the
-        validator then rejected - the user got nothing for a 90-second wait.
-
-        A catalog-driven fallback is strictly better: it satisfies the brief's
-        item counts, prices correctly, and the prose simply stays generic. The
-        honesty cost is handled by the `partial` flag on the response.
+        Build a room-specific catalog design without relying on a provider.
         """
-        from app.engine.brief import find_products
+        from app.catalog import catalog
+        from app.engine.brief import canonical_item_for
 
         brief = brief or parse_brief(
             client_preferences=request.client_preferences,
@@ -635,23 +628,65 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             lifestyle_notes=request.lifestyle_notes,
         )
 
-        # The fallback used to take `find_products(category)[0]` per required
-        # category and ignore the budget completely, so a Rs 10,000 brief
-        # produced a Rs 18,200 room that the validator then (correctly)
-        # rejected. The design the user saw by default was always invalid.
-        # Route it through the optimizer, which respects the budget and falls
-        # back to the essentials when the brief is unaffordable.
         from app.engine.budget_optimizer import optimize_to_budget
 
         required = dict(brief.required_items)
         optional = {k: 1 for k in (brief.optional_items or ())}
+        selected_products = []
+        selected_terms = set()
+        for selected in brief.selected_furniture:
+            phrase = selected.strip().lower()
+            term = canonical_item_for(phrase)
+            selected_terms.add(term)
+            matches = [
+                product for product in catalog.for_room(brief.room_type)
+                if phrase in product.name.lower()
+            ]
+            if matches:
+                selected_products.append(
+                    min(matches, key=lambda product: (product.price_inr, product.name))
+                )
+        for term in selected_terms:
+            required.pop(term, None)
+            optional.pop(term, None)
+
+        requirements = {
+            str(value).strip().lower().replace("-", "_").replace(" ", "_")
+            for value in brief.special_requirements
+        }
+        if "heavy_storage" in requirements:
+            requirements.add("storage_heavy")
+        if "storage_heavy" in requirements and not any(
+            product.category in {"storage", "wardrobe"} for product in selected_products
+        ):
+            selected_products.append(catalog.get("STO-CHV-01"))
+        if "entertainment" in requirements and not any(
+            product.category == "tv_unit" for product in selected_products
+        ):
+            selected_products.append(catalog.get("TVU-WAL-01"))
+        selected_products = [p for p in selected_products if p is not None]
+
+        # A selected chip is a commitment, not an optional optimizer pick.
+        # Reserve its catalog cost first, then fit any other explicitly
+        # requested items into the remaining budget.
+        selected_cost = sum(p.price_inr for p in selected_products)
+        optimizer_budget = (
+            max(0, brief.budget_inr - selected_cost)
+            if brief.budget_inr is not None else None
+        )
         if not required:
-            from app.engine.brief import ROOM_CATEGORIES
-            required = {c: 1 for c in list(ROOM_CATEGORIES.get(brief.room_type, ()))[:3]}
+            if not selected_products:
+                from app.engine.brief import ROOM_CATEGORIES
+
+                defaults = (
+                    ("sofa", "tv_unit") if brief.room_type == "living_room"
+                    else tuple(ROOM_CATEGORIES.get(brief.room_type, ()))[:2]
+                )
+                required = {category: 1 for category in defaults}
 
         optimised = optimize_to_budget(
             required=required,
-            budget_inr=brief.budget_inr,
+            budget_inr=optimizer_budget,
             optional=optional,
             style_tier=request.budget.value,
             audience=brief.audience,
@@ -666,8 +701,67 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             }
             for sel in optimised["selections"]
         ]
-        # Record *why* anything is absent, so the validator reports a budget
-        # constraint rather than accusing the model of forgetting an item.
+        furniture.extend({
+            "name": product.name,
+            "category": product.category,
+            "sku": product.sku,
+            "quantity": 1,
+            "brand_suggestions": [product.brand],
+        } for product in selected_products)
+
+        # Catalog alternatives keep every selected and required item, then
+        # vary the unselected accessory mix enough to be visibly distinct.
+        if variation_index > 0:
+            from app.engine.brief import BRIEF_TO_CATALOG_CATEGORY
+
+            mandatory_categories = {
+                catalog_category
+                for category in required
+                for catalog_category in BRIEF_TO_CATALOG_CATEGORY.get(
+                    category, (category,)
+                )
+            }
+            selected_skus = {product.sku for product in selected_products}
+            selected_categories = {product.category for product in selected_products}
+            accessory_skus = ("LMP-FLO-01", "DEC-PLT-01", "LMP-CEL-01")
+            accessory_categories = {
+                product.category for sku in accessory_skus
+                if (product := catalog.get(sku)) is not None
+                and catalog.allowed_in_room(product, brief.room_type)
+            }
+            mandatory_categories -= selected_categories | accessory_categories
+            furniture = [
+                item for item in furniture
+                if item["sku"] in selected_skus
+                or item["category"] in mandatory_categories
+            ]
+            current_skus = {item["sku"] for item in furniture}
+            current_total = sum(
+                catalog.get(item["sku"]).price_inr * int(item.get("quantity", 1))
+                for item in furniture if catalog.get(item["sku"]) is not None
+            )
+            for sku in accessory_skus[: min(variation_index + 1, len(accessory_skus))]:
+                accessory = catalog.get(sku)
+                if (
+                    accessory is None
+                    or accessory.sku in current_skus
+                    or not catalog.allowed_in_room(accessory, brief.room_type)
+                    or (
+                        brief.budget_inr is not None
+                        and current_total + accessory.price_inr > brief.budget_inr
+                    )
+                ):
+                    continue
+                furniture.append({
+                    "name": accessory.name,
+                    "category": accessory.category,
+                    "sku": accessory.sku,
+                    "quantity": 1,
+                    "brand_suggestions": [accessory.brand],
+                })
+                current_skus.add(accessory.sku)
+                current_total += accessory.price_inr
+
         _budget_infeasible = None
         budget_note = None
         if not optimised["feasible"]:
@@ -680,26 +774,7 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
             }
             budget_note = optimised["infeasible"]
 
-        if not furniture and brief.budget_inr is None:
-            # No budget was stated and nothing was requested, so propose a
-            # coherent starter set rather than shipping an empty room.
-            #
-            # Gated on "no budget given" deliberately: when a budget *was*
-            # stated and nothing fits, adding unbudgeted items here silently
-            # broke the budget the optimizer had just honoured - a Rs 2,000
-            # brief came back with a Rs 7,700 room.
-            from app.engine.brief import ROOM_CATEGORIES
-            for category in ROOM_CATEGORIES.get(brief.room_type, ())[:3]:
-                options = find_products(category)
-                if options:
-                    product = options[0]
-                    furniture.append({
-                        "name": product.name, "category": product.category,
-                        "sku": product.sku, "quantity": 1,
-                    })
-        elif not furniture and brief.budget_inr is not None:
-            # A budget was given and nothing is affordable. Saying so beats
-            # inventing furniture the client cannot buy.
+        if not furniture and brief.budget_inr is not None:
             if not budget_note:
                 budget_note = (
                     f"Nothing in this brief is affordable within "
@@ -715,56 +790,85 @@ from the catalog. An item whose SKU is not in the list above is discarded."""
                 }
 
         room = request.room_type.value.replace("_", " ").title()
-        listed = ", ".join(f["name"] for f in furniture[:4]) or "the essential pieces"
+        names = [item["name"] for item in furniture]
+        listed = ", ".join(names[:5]) or "the selected items"
+        storage_names = [
+            item["name"] for item in furniture
+            if item["category"] in {"storage", "wardrobe"}
+        ]
+        lighting_names = [
+            item["name"] for item in furniture if item["category"] == "lighting"
+        ]
+        decor_names = [
+            item["name"] for item in furniture
+            if item["category"] in {"decor", "soft"}
+        ]
+
+        requirement_notes: List[str] = []
+        if "kids_safe" in requirements:
+            requirement_notes.append(
+                "Kids Safe: specify rounded edges, anchor tall furniture to the wall, "
+                "and avoid glass surfaces."
+            )
+        if "storage_heavy" in requirements:
+            requirement_notes.append(
+                "Heavy Storage: use the listed storage furniture and anchor tall units."
+            )
+        if "low_maintenance" in requirements:
+            requirement_notes.append(
+                "Low Maintenance: choose wipe-clean, durable surfaces for daily use."
+            )
+        if "natural_light" in requirements and brief.window_direction:
+            requirement_notes.append(
+                f"Natural Light: keep the {brief.window_direction}-facing window clear "
+                "to use available daylight."
+            )
+        if "entertainment" in requirements:
+            requirement_notes.append(
+                "Entertainment: centre the viewing area on the listed TV unit."
+            )
+
+        if brief.room_type == "living_room":
+            zones = [
+                "Living area: " + ", ".join(
+                    item["name"] for item in furniture
+                    if item["category"] in {"seating", "tv_unit", "table"}
+                ) or "selected furniture"
+            ]
+        else:
+            zones = plan.get("zones", []) or [f"{room.lower()} furniture zone"]
 
         fallback = {
-            "title": f"{request.style.value.title()} {room}",
-            "concept": (
-                f"A practical, well-organised {room.lower()} built around "
-                f"{listed}."
-            ),
-            # Never a template sentinel: the placeholder check would block it.
+            "title": f"{request.style.value.title()} {room}"
+            + (f" - Accessory {variation_index + 1}" if variation_index else ""),
+            "concept": f"A {request.style.value} {room.lower()} arranged around {listed}.",
             "layout_description": (
-                f"Group the {listed} along the walls, keeping the centre of the "
-                f"room clear for circulation. Storage is wall-mounted where "
-                f"possible to free floor space."
+                f"Place {listed} to preserve a clear circulation route through the "
+                f"{room.lower()}. " + " ".join(requirement_notes)
             ),
-            "zones": plan.get("zones", []) or ["sleeping", "study", "storage"],
+            "zones": zones,
             "furniture": furniture,
             "color_palette": _fallback_palette(brief.color_scheme),
             "lighting_plan": (
-                "Layered lighting: a warm 3000K ceiling light for general "
-                "illumination, a 4000K task light at the desk, and dimmable "
-                "accent lighting to finish the room."
+                f"Use the listed {', '.join(lighting_names)} for room lighting."
+                if lighting_names else
+                "Retain the room's existing lighting; no new lighting product is listed."
             ),
             "storage_strategy": (
-                "Wall-mounted and under-bed storage, sized to the available "
-                "wall length rather than bought as freestanding units."
+                f"Storage is provided by {', '.join(storage_names)}."
+                if storage_names else
+                "No additional storage product is included in this option."
             ),
             "decor_suggestions": [
-                "One large rug to anchor the seating or sleeping area",
-                "Curtains with a blackout lining if the window faces west",
+                f"Use the listed {name} as the room's accessory." for name in decor_names
             ],
             "brands": sorted({f.get("brand", "") for f in furniture} - {""}),
             "pros": [
-                "Every item is a real catalog product with a verifiable price",
-                "Fits a constrained budget without inventing a number",
+                "Every listed product has a catalog SKU and price",
+                f"The selected room brief is applied to the {room.lower()} layout",
             ],
-            "cons": (
-                [budget_note] if _budget_infeasible else
-                [
-                    "Prose is generic because this design was assembled by the "
-                    "fallback path rather than written by the design agent",
-                ]
-            ),
-            "trade_offs": (
-                [budget_note] if _budget_infeasible else
-                [
-                    "Overhead and tall units need wall space, which reduces "
-                    "decorative wall area",
-                    "Prose is generic because this design was assembled by code",
-                ]
-            ),
+            "cons": [budget_note] if _budget_infeasible else [],
+            "trade_offs": [budget_note] if _budget_infeasible else [],
             # Carried through so the validator can distinguish "the model forgot
             # an item" from "the budget could not buy this item".
             "_budget_infeasible": _budget_infeasible,
@@ -1230,7 +1334,9 @@ class DesignPipeline:
         self.critic = CriticAgent()
         # Tracks which model actually served the most recent request so the
         # response reports reality rather than the configured default.
-        self._last_model = settings.DEFAULT_MODEL
+        self._last_model = (
+            settings.DEFAULT_MODEL if registry.all() else "Rule-based mode"
+        )
         # Near-duplicate options rejected by the last request, surfaced to the
         # client so a short list is explained rather than looking like a bug.
         self._rejected_options: List[str] = []
@@ -1399,9 +1505,7 @@ class DesignPipeline:
             if product and not catalog.allowed_in_room(product, room):
                 filtered.append(f"{product.name} ({product.sku})")
         if filtered:
-            design["_room_filter_violations"] = sorted(set(
-                (design.get("_room_filter_violations") or []) + filtered
-            ))
+            logger.info("wrong_room_items_removed items=%s", sorted(set(filtered)))
         design["furniture"] = self._clean_furniture(design, constraints)
 
         # Repair invented SKUs before costing, so the repaired lines are picked
@@ -1537,6 +1641,44 @@ class DesignPipeline:
         from app.engine.brief import products_satisfying
         from app.engine.validator import _count_items
         from app.engine.validator import _SYNONYM_CATEGORIES
+        from app.engine.brief import canonical_item_for
+
+        existing_skus = {
+            str(item.get("sku", "")).strip().upper()
+            for item in furniture if isinstance(item, dict)
+        }
+        for selected in constraints.selected_furniture:
+            selected_name = str(selected).strip().lower()
+            if not selected_name or any(
+                selected_name in str(item.get("name", "")).lower()
+                for item in furniture if isinstance(item, dict)
+            ):
+                continue
+            candidates = [
+                product for product in catalog.for_room(constraints.room_type)
+                if selected_name in product.name.lower()
+            ]
+            if not candidates:
+                term = canonical_item_for(selected_name)
+                candidates = [
+                    product for product in products_satisfying(
+                        term, audience=constraints.audience
+                    )
+                    if catalog.allowed_in_room(product, constraints.room_type)
+                ]
+            if not candidates:
+                logger.warning("selected_catalog_item_unavailable item=%s", selected)
+                continue
+            product = min(candidates, key=lambda item: (item.price_inr, item.name))
+            if product.sku not in existing_skus:
+                furniture.append({
+                    "name": product.name,
+                    "category": product.category,
+                    "sku": product.sku,
+                    "quantity": 1,
+                    "brand_suggestions": [product.brand],
+                })
+                existing_skus.add(product.sku)
 
         for category, requested in constraints.required_items.items():
             if requested <= 0:
@@ -1556,7 +1698,12 @@ class DesignPipeline:
 
             # Resolve through the brief->catalog mapping, so "sofa" finds a
             # sofa rather than any old piece of seating.
-            options = products_satisfying(category)
+            options = [
+                product for product in products_satisfying(
+                    category, audience=constraints.audience
+                )
+                if catalog.allowed_in_room(product, constraints.room_type)
+            ]
             if not options:
                 # Nothing in the catalog for this term; the validator
                 # will report it rather than this inventing a product.
@@ -1781,6 +1928,9 @@ class DesignPipeline:
                 # Price in Python, not in the prompt. The model never sees a
                 # number and never gets to state one.
                 costing = price_design(design, budget_inr=constraints.budget_inr)
+                design["layout"] = self._layout_for(
+                    design, costing, constraints
+                ) or {}
 
                 # The Vastu assessment is attached before validation, because
                 # the validator blocks a Strict design whose cooking rule
@@ -1788,6 +1938,49 @@ class DesignPipeline:
                 self._attach_vastu(design, constraints)
 
                 report = validate_design(design, constraints, costing)
+                if not report.is_valid and not registry.all():
+                    repaired = self.architect._fallback_design(
+                        request, plan, constraints
+                    )
+                    repaired = self._normalize_design(repaired, constraints)
+                    repaired_cost = price_design(
+                        repaired, budget_inr=constraints.budget_inr
+                    )
+                    repaired["layout"] = self._layout_for(
+                        repaired, repaired_cost, constraints
+                    ) or {}
+                    self._attach_vastu(repaired, constraints)
+                    repaired_report = validate_design(
+                        repaired, constraints, repaired_cost
+                    )
+                    if (
+                        repaired_report.is_valid
+                        or repaired_report.pass_rate > report.pass_rate
+                    ):
+                        logger.info(
+                            "catalog_design_repaired before=%d after=%d",
+                            len(report.errors), len(repaired_report.errors),
+                        )
+                        design, costing, report = (
+                            repaired, repaired_cost, repaired_report
+                        )
+                        yield {
+                            "type": "step",
+                            "data": AgentStep(
+                                agent="pipeline",
+                                status="ok" if report.is_valid else "warning",
+                                message=(
+                                    "Catalog mode applied deterministic repairs and "
+                                    "re-validated the design."
+                                ),
+                                data={
+                                    "remaining_issues": [
+                                        violation.to_dict()
+                                        for violation in report.violations
+                                    ]
+                                },
+                            ).model_dump(),
+                        }
                 yield {
                     "type": "step",
                     "data": AgentStep(
@@ -2004,6 +2197,32 @@ class DesignPipeline:
         Concurrency is bounded so we do not overwhelm the LLM provider or
         trip a rate limit; each option is independent.
         """
+        if not registry.all():
+            if brief is None:
+                brief = self._parse_constraints(request)
+            self._last_model = "Rule-based mode"
+            self._rejected_options = []
+            options = []
+            for index in range(request.num_options):
+                if index == 0 and seed_design is not None:
+                    design = seed_design
+                else:
+                    design = self.architect._fallback_design(
+                        request, plan, brief, variation_index=index
+                    )
+                    design = self._normalize_design(design, brief)
+                options.append(self._to_option(design, request, brief))
+            distinct, rejected = select_distinct(
+                [option.model_dump() for option in options]
+            )
+            self._rejected_options = [
+                describe_rejection(item) for item in rejected
+            ]
+            return [
+                option for option in options
+                if any(option.model_dump() == candidate for candidate in distinct)
+            ][: request.num_options]
+
         if request.num_options <= 1:
             if seed_design is not None:
                 return [self._to_option(seed_design, request, brief)]
@@ -2147,6 +2366,7 @@ class DesignPipeline:
         # The response-level validation describes the design that won the
         # reflection loop; the option card must describe the option on it.
         layout = self._layout_for(design, costed, constraints)
+        design["layout"] = layout or {}
         self._attach_vastu(design, constraints)
         report = validate_design(design, constraints, costed)
         for item in design.get("furniture", []) or []:
@@ -2248,6 +2468,43 @@ class DesignPipeline:
 
         # Brands come from the catalog rows that were actually bought.
         brands = sorted({f.brand_suggestions[0] for f in furniture if f.brand_suggestions})
+        option_total = total_inr([f.model_dump() for f in furniture])
+        remaining_budget = (
+            max(0, constraints.budget_inr - option_total)
+            if constraints.budget_inr is not None else None
+        )
+        purchased_skus = {str(row.get("sku") or "").upper() for row in shopping_list}
+        budget_suggestions: List[Dict[str, Any]] = []
+        if remaining_budget:
+            from app.catalog import catalog
+
+            candidates = catalog.for_room(constraints.room_type)
+            if constraints.room_type == "living_room":
+                candidates = [
+                    product for product in candidates
+                    if not any(
+                        word in product.name.lower()
+                        for word in ("desk", "night lamp", "bedside", "toy", "study")
+                    )
+                ]
+                priority = {
+                    "seating": 0, "tv_unit": 1, "table": 2,
+                    "decor": 3, "lighting": 4, "storage": 5,
+                }
+                candidates.sort(key=lambda product: (
+                    priority.get(product.category, 9), product.price_inr, product.name
+                ))
+            for product in candidates:
+                if product.sku.upper() in purchased_skus:
+                    continue
+                if product.price_inr <= remaining_budget:
+                    budget_suggestions.append({
+                        "sku": product.sku,
+                        "name": product.name,
+                        "price_inr": product.price_inr,
+                    })
+                if len(budget_suggestions) == 3:
+                    break
 
         trade_offs = safe_list(design.get("trade_offs")) or safe_list(design.get("cons"))
         vastu = design.get("_vastu") or {}
@@ -2282,7 +2539,9 @@ class DesignPipeline:
             decor_suggestions=safe_list(design.get("decor_suggestions"))[:12],
             # The option total is the sum of the rows above it, by the one
             # shared function the edit step and the PDF also use.
-            estimated_cost_inr=total_inr([f.model_dump() for f in furniture]),
+            estimated_cost_inr=option_total,
+            remaining_budget_inr=remaining_budget,
+            budget_suggestions=budget_suggestions,
             budget_breakdown=[
                 BudgetBreakdown(
                     category=str(b.get("category", "misc"))[:100],

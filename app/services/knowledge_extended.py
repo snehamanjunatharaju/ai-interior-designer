@@ -792,7 +792,7 @@ EXTENDED_KNOWLEDGE: List[Dict[str, str]] = [
             "table, seating that sits near the floor - and when storage is "
             "hidden behind sliding panels rather than shown as open shelving. "
             "Low furniture is not a style preference in a small apartment: "
-            "it persists the sightline and makes a 9 x 11 ft room read larger."
+            "it preserves the sightline and makes a 9 x 11 ft room read larger."
         ),
     },
     {

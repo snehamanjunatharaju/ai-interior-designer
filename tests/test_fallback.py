@@ -196,13 +196,19 @@ class TestFallback:
         codes = {v.code for v in report.violations}
         assert "missing_items" not in codes, codes
 
-    def test_is_honest_about_being_generic(self):
-        """The user should know the prose came from the fallback."""
+    def test_does_not_leak_internal_implementation_notes(self):
+        """Fallback internals belong in logs, not client-facing copy."""
         design, _, _, _ = _run(
             client_preferences="A kids room for two.",
             room_type="kids_room", color_scheme="vibrant", budget_amount_inr=10000,
         )
-        assert design["cons"], "a fallback design must state its own limitation"
+        client_copy = " ".join(
+            design.get(key, "") if isinstance(design.get(key), str)
+            else " ".join(design.get(key, []))
+            for key in ("concept", "layout_description", "cons", "trade_offs")
+        ).lower()
+        assert "assembled by code" not in client_copy
+        assert "fallback path" not in client_copy
 
     def test_deterministic(self):
         a, _, _, _ = _run(

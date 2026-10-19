@@ -44,7 +44,7 @@ from app.engine.occupants import (
 ITEM_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "bed": ("bed", "cot", "bunk", "bedstead", "crib"),
     "mattress": ("mattress", "mat"),
-    "desk": ("desk", "study table", "table", "workstation"),
+    "desk": ("desk", "study table", "workstation"),
     "chair": ("chair", "stool", "seating"),
     "wardrobe": ("wardrobe", "closet", "almirah", "almirah"),
     "bookshelf": ("bookshelf", "book shelf", "shelf", "bookcase", "shelving"),
@@ -52,6 +52,7 @@ ITEM_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "armchair": ("armchair", "arm chair", "single chair", "lounge chair"),
     "beanbag": ("bean bag", "beanbag"),
     "tv_unit": ("tv unit", "tv stand", "television unit", "tv console", "tv"),
+    "shoe_rack": ("shoe rack", "shoe cabinet", "shoe storage"),
     "rug": ("rug", "carpet", "mat"),
     "curtain": ("curtain", "curtains", "drape", "blinds"),
     "mirror": ("mirror",),
@@ -118,7 +119,7 @@ NUMBER_WORDS = {
 # Which items make sense in which room, so a "kids room" brief does not
 # silently generate a kitchen. Values are the categories the catalog uses.
 ROOM_CATEGORIES: Dict[str, Tuple[str, ...]] = {
-    "living_room": ("sofa", "seating", "tv_unit", "rug", "table", "mirror", "lighting", "decor"),
+    "living_room": ("sofa", "seating", "tv_unit", "rug", "table", "storage", "mirror", "lighting", "decor"),
     "bedroom": ("bed", "mattress", "wardrobe", "side_table", "table", "curtain", "rug", "lighting"),
     "kids_room": ("bed", "mattress", "desk", "chair", "wardrobe", "bookshelf", "storage", "curtain", "rug", "decor"),
     "home_office": ("desk", "chair", "bookshelf", "storage", "table", "lighting"),
@@ -149,6 +150,7 @@ BRIEF_TO_CATALOG_CATEGORY: Dict[str, Tuple[str, ...]] = {
     "bookshelf": ("storage",),
     "storage": ("storage",),
     "tv_unit": ("tv_unit",),
+    "shoe_rack": ("storage",),
     "wardrobe": ("wardrobe",),
     "mattress": ("mattress",),
     "rug": ("soft",),
@@ -183,6 +185,7 @@ ACCEPTABLE_PRODUCTS: Dict[str, Tuple[str, ...]] = {
     "bookshelf": ("bookshelf", "book shelf", "shelf", "shelving", "cube", "storage"),
     # A mirror is a decor-category product, but a planter is not a mirror.
     "mirror": ("mirror",),
+    "shoe_rack": ("shoe rack", "shoe cabinet", "shoe storage"),
     # Without these, a "chimney" request would be satisfied by any kitchen
     # item and the checker would pass a design with no ventilation at all.
     "kitchen_cabinets": ("overhead", "wall cabinet", "base unit"),
@@ -695,10 +698,10 @@ def products_satisfying(
         p for p in products
         if any(word in p.name.lower() for word in acceptable)
     ]
-    # If nothing in the catalog matches the specific type, fall back to the
-    # category rather than reporting the item as unavailable.
-    chosen = narrowed or products
-    return chosen[:limit] if limit else chosen
+    # A different product from the same broad category is not a valid
+    # substitute ("Bookshelf" is not a "Shoe Rack"). Let validation report
+    # the item as unavailable rather than silently swapping it.
+    return narrowed[:limit] if limit else narrowed
 
 
 # --------------------------------------------------------------------------
@@ -771,6 +774,9 @@ class BriefConstraints:
 
     # item -> requested count, only for items explicitly mentioned
     required_items: Dict[str, int] = field(default_factory=dict)
+    # Exact product labels chosen through the form, preserved so neither an
+    # LLM nor a broad category lookup can substitute a different item.
+    selected_furniture: List[str] = field(default_factory=list)
     # items mentioned with no count given
     optional_items: List[str] = field(default_factory=list)
     # items the brief explicitly says to avoid
@@ -809,6 +815,7 @@ class BriefConstraints:
             "dimensions": self.dimensions.to_dict(),
             "vastu_compliance": self.vastu_compliance,
             "required_items": dict(self.required_items),
+            "selected_furniture": list(self.selected_furniture),
             "optional_items": list(self.optional_items),
             "excluded_items": list(self.excluded_items),
             "door_direction": self.door_direction,
@@ -870,6 +877,7 @@ def parse_brief(
         style=style or "",
         vastu_compliance=vastu_compliance,
         occupants=list(occupants),
+        selected_furniture=[str(item).strip() for item in furniture if str(item).strip()],
         special_requirements=[str(r).strip() for r in specific_requirements if str(r).strip()],
         lifestyle_notes=lifestyle_notes or "",
         raw_text=text,

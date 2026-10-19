@@ -188,6 +188,27 @@ RULES: Dict[str, VastuRule] = {
         severity="advice",
         rooms=("living_room",),
     ),
+    "seating_faces_north_or_east": VastuRule(
+        code="seating_faces_north_or_east",
+        title="Seating faces north or east",
+        principle="Main living-room seating faces north or east.",
+        severity="advice",
+        rooms=("living_room",),
+    ),
+    "northeast_corner_light": VastuRule(
+        code="northeast_corner_light",
+        title="Keep the north-east corner light",
+        principle="Avoid placing heavy furniture in the north-east corner.",
+        severity="advice",
+        rooms=("living_room",),
+    ),
+    "heavy_seating_south_or_west": VastuRule(
+        code="heavy_seating_south_or_west",
+        title="Heavy seating in the south or west",
+        principle="Place heavy living-room seating along the south or west wall.",
+        severity="advice",
+        rooms=("living_room",),
+    ),
     "light_from_north_east": VastuRule(
         code="light_from_north_east",
         title="Best light enters from the north-east",
@@ -202,9 +223,11 @@ _SATISFYING: Dict[str, tuple] = {
     "bed_head_south": ("south", "southwest"),
     "desk_east_or_north": ("east", "northeast", "north"),
     "wardrobe_southwest": ("southwest", "south", "west"),
-    "cook_south_east": ("southeast", "south"),
+    "cook_south_east": ("southeast",),
     "sink_north_east": ("northeast", "north", "east"),
     "tv_west_or_north": ("west", "northwest", "north"),
+    "seating_faces_north_or_east": ("north", "east"),
+    "heavy_seating_south_or_west": ("south", "west"),
 }
 
 # Remedy text, keyed by rule.
@@ -224,6 +247,9 @@ _REMEDY: Dict[str, str] = {
     "tv_west_or_north": "Move the TV unit to the west or north wall.",
     "light_from_north_east": "If possible, place the study or main seating near "
                              "the north-east window.",
+    "seating_faces_north_or_east": "Rotate the main seating to face north or east.",
+    "northeast_corner_light": "Move heavy furniture out of the north-east corner.",
+    "heavy_seating_south_or_west": "Move heavy seating to the south or west wall.",
 }
 
 
@@ -253,6 +279,8 @@ def evaluate_vastu(
     door_direction: Optional[str] = None,
     window_direction: Optional[str] = None,
     compliance: str = "soft",
+    room_width_cm: Optional[float] = None,
+    room_depth_cm: Optional[float] = None,
 ) -> VastuReport:
     """
     Score a design against the Vastu rules, in code.
@@ -399,6 +427,84 @@ def evaluate_vastu(
             remedy="" if ok else _REMEDY["tv_west_or_north"],
             item_name="TV unit", item_category="tv_unit",
         ))
+
+    if room_type == "living_room":
+        seating = [
+            item for item in by_category.get("seating", [])
+            if item.get("wall") or item.get("facing")
+        ]
+        if seating:
+            facing_by_wall = {
+                "north": "south", "south": "north",
+                "east": "west", "west": "east",
+            }
+            facings = [
+                str(item.get("facing") or facing_by_wall.get(str(item.get("wall")), ""))
+                for item in seating
+            ]
+            ok = all(direction in _SATISFYING["seating_faces_north_or_east"]
+                     for direction in facings)
+            results.append(VastuResult(
+                rule=RULES["seating_faces_north_or_east"],
+                passed=ok,
+                explanation=(
+                    f"Main seating faces {', '.join(sorted(set(facings)))}."
+                    if ok else
+                    f"Main seating faces {', '.join(sorted(set(facings)))}; north or east is preferred."
+                ),
+                remedy="" if ok else _REMEDY["seating_faces_north_or_east"],
+                item_name=", ".join(item.get("name", "seating") for item in seating),
+                item_category="seating",
+            ))
+
+        heavy_seating = [
+            item for item in by_category.get("seating", [])
+            if item.get("wall")
+        ]
+        if heavy_seating:
+            walls = [str(item.get("wall")) for item in heavy_seating]
+            ok = all(wall in _SATISFYING["heavy_seating_south_or_west"]
+                     for wall in walls)
+            results.append(VastuResult(
+                rule=RULES["heavy_seating_south_or_west"],
+                passed=ok,
+                explanation=(
+                    f"Heavy seating is on the {', '.join(sorted(set(walls)))} wall."
+                    if ok else
+                    f"Heavy seating is on the {', '.join(sorted(set(walls)))} wall; south or west is preferred."
+                ),
+                remedy="" if ok else _REMEDY["heavy_seating_south_or_west"],
+                item_name=", ".join(item.get("name", "seating") for item in heavy_seating),
+                item_category="seating",
+            ))
+
+        if room_width_cm and room_depth_cm:
+            heavy = [
+                item for item in layout_items or []
+                if isinstance(item, dict)
+                and str(item.get("category", "")).lower()
+                    in {"seating", "storage", "wardrobe"}
+                and item.get("x") is not None
+                and item.get("y") is not None
+            ]
+            in_corner = [
+                item for item in heavy
+                if float(item["x"]) + float(item.get("width", 0)) / 2 >= room_width_cm / 2
+                and float(item["y"]) + float(item.get("depth", 0)) / 2 <= room_depth_cm / 2
+            ]
+            results.append(VastuResult(
+                rule=RULES["northeast_corner_light"],
+                passed=not in_corner,
+                explanation=(
+                    "The north-east corner has no heavy furniture."
+                    if not in_corner else
+                    f"{', '.join(item.get('name', 'Heavy item') for item in in_corner)} "
+                    "occupies the north-east corner."
+                ),
+                remedy="" if not in_corner else _REMEDY["northeast_corner_light"],
+                item_name=", ".join(item.get("name", "") for item in in_corner),
+                item_category="living_room",
+            ))
 
     # --- kitchen-specific ---------------------------------------------
     if room_type == "kitchen":
@@ -559,6 +665,11 @@ def analyse_design(
                 "category": placed.get("category", ""),
                 "wall": placed.get("wall"),
                 "height": placed.get("height", 0),
+                "x": placed.get("x"),
+                "y": placed.get("y"),
+                "width": placed.get("width", 0),
+                "depth": placed.get("depth", 0),
+                "facing": placed.get("facing"),
             })
     if not items:
         # No plan yet. Placement rules cannot be judged without geometry, so
@@ -574,6 +685,8 @@ def analyse_design(
         door_direction=getattr(brief, "door_direction", None),
         window_direction=getattr(brief, "window_direction", None),
         compliance=compliance,
+        room_width_cm=(layout.get("room") or {}).get("width_cm"),
+        room_depth_cm=(layout.get("room") or {}).get("depth_cm"),
     )
 
     # A kitchen under Strict is *required* to show a south-east cooking

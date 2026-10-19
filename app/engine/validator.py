@@ -211,6 +211,7 @@ def validate_design(
     report = ValidationReport()
 
     _check_required_items(design, brief, report)
+    _check_selected_furniture(design, brief, report)
     _check_excluded_items(design, brief, report)
     _check_audience(design, brief, report)
     _check_room_appropriate(design, brief, report)
@@ -393,9 +394,7 @@ def _check_room_appropriate(
     if not room:
         return
 
-    offenders: List[str] = list(
-        design.get("_room_filter_violations") or []
-    )
+    offenders: List[str] = []
     for entry in design.get("furniture", []) or []:
         if not isinstance(entry, dict):
             continue
@@ -438,32 +437,61 @@ def _check_special_requirements(
     if not requirements:
         return
 
-    horizon: List[str] = []
+    text_horizon: List[str] = []
     for key in ("concept", "layout_description", "lighting_plan",
                 "storage_strategy", "title"):
         value = design.get(key)
         if isinstance(value, str):
-            horizon.append(value)
+            text_horizon.append(value)
     for key in ("decor_suggestions", "pros", "zones"):
-        horizon.extend(str(v) for v in (design.get(key) or []))
+        text_horizon.extend(str(v) for v in (design.get(key) or []))
+    blob = " ".join(text_horizon).lower()
+    products: List[Any] = []
     for entry in design.get("furniture", []) or []:
         if isinstance(entry, dict):
-            horizon.append(str(entry.get("name", "")))
             product = catalog.get(str(entry.get("sku", "")).strip())
             if product is not None:
-                horizon.append(product.name)
-                horizon.append(product.notes)
-    blob = " ".join(horizon).lower()
+                products.append(product)
 
     for raw in requirements:
         key = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+        if key == "heavy_storage":
+            key = "storage_heavy"
         label = REQUIREMENT_LABELS.get(key, str(raw))
         keywords = REQUIREMENT_KEYWORDS.get(key)
         report.checks_run += 1
-        # An unknown chip is not checkable in code, so it is not failed -
-        # accusing a design of ignoring a requirement nobody defined would be
-        # a false positive.
-        if not keywords or any(k in blob for k in keywords):
+        addressed = False
+        if key == "kids_safe":
+            addressed = any(k in blob for k in (
+                "rounded edge", "rounded corner", "no glass", "non-glass",
+                "anchored", "anti-tip", "anti-skid", "non-toxic", "child-safe",
+                "child safe", "kids safe",
+            ))
+        elif key == "low_maintenance":
+            addressed = any(k in blob for k in (
+                "wipe-clean", "wipe clean", "easy-clean", "easy clean",
+                "washable", "stain-resistant", "laminate", "low maintenance",
+            ))
+        elif key == "storage_heavy":
+            has_storage = any(p.category in {"storage", "wardrobe"} for p in products)
+            addressed = has_storage and any(k in blob for k in (
+                "heavy storage", "ample storage", "closed storage",
+                "storage capacity", "storage unit", "bookshelf", "shoe rack",
+            ))
+        elif key == "natural_light":
+            direction = str(getattr(brief, "window_direction", "") or "").lower()
+            addressed = any(k in blob for k in ("natural light", "daylight"))
+            if direction:
+                addressed = addressed and direction in blob
+        elif key == "entertainment":
+            has_media = any(p.category == "tv_unit" for p in products)
+            addressed = has_media and any(k in blob for k in (
+                "entertainment", "media", "television", "tv viewing",
+            ))
+        elif keywords:
+            addressed = any(k in blob for k in keywords)
+        # An unknown chip is not checkable in code, so it is not failed.
+        if addressed or not keywords:
             report.checks_passed += 1
             continue
         report.violations.append(Violation(
@@ -475,9 +503,53 @@ def _check_special_requirements(
             expected=label,
             actual="not mentioned and not supported by any item",
             remedy_hint=(
-                f"Address {label} explicitly in the layout or storage text and "
-                f"with a catalog item that provides it."
+                f"State how {label} is met in the design text and include any "
+                "required supporting catalog item."
             ),
+        ))
+
+
+def _check_selected_furniture(
+    design: Dict[str, Any], brief: BriefConstraints, report: ValidationReport
+) -> None:
+    """Every furniture chip selected on the form must be a priced design item."""
+    from app.engine.brief import canonical_item_for
+
+    entries = [
+        entry for entry in (design.get("furniture") or [])
+        if isinstance(entry, dict)
+    ]
+    for selected in getattr(brief, "selected_furniture", []) or []:
+        report.checks_run += 1
+        selected_name = str(selected).strip().lower()
+        canonical = canonical_item_for(selected_name)
+        matching = False
+        for entry in entries:
+            product = catalog.get(str(entry.get("sku", "")).strip())
+            name = (product.name if product else str(entry.get("name", ""))).lower()
+            if selected_name in name or name in selected_name:
+                matching = True
+                break
+            if canonical == "shoe_rack" and any(
+                word in name for word in ("shoe rack", "shoe cabinet", "shoe storage")
+            ):
+                matching = True
+                break
+            if canonical == "bookshelf" and any(
+                word in name for word in ("bookshelf", "book shelf")
+            ):
+                matching = True
+                break
+        if matching:
+            report.checks_passed += 1
+            continue
+        report.violations.append(Violation(
+            code="selected_furniture_missing",
+            severity=SEVERITY_ERROR,
+            message=f"The selected furniture item '{selected}' is not in the shopping list.",
+            expected=str(selected),
+            actual="not purchased",
+            remedy_hint=f"Add the selected '{selected}' product from the catalog.",
         ))
 
 

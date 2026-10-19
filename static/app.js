@@ -22,6 +22,13 @@
         return "₹" + n;
     }
 
+    function displayLabel(value) {
+        return String(value || "")
+            .replace(/_/g, " ")
+            .replace(/\b[a-z]/g, (letter) => letter.toUpperCase())
+            .replace(/\bTv\b/g, "TV");
+    }
+
     function esc(str) {
         const div = document.createElement("div");
         div.textContent = str == null ? "" : String(str);
@@ -186,6 +193,14 @@
 
             const s = plan.score || {};
             const room = plan.room || {};
+            const blocking = (data && (
+                ((data.validation && data.validation.violations) || [])
+                    .some((v) => v.severity === "error")
+                || ((data.options || []).some((option) =>
+                    ((option.validation && option.validation.violations) || [])
+                        .some((v) => v.severity === "error")
+                ))
+            ));
             // The exact dimensions the client entered, with the area and the
             // bearings actually used, so the plan is traceable to the form.
             const dimChip = room.dimension_text
@@ -199,7 +214,7 @@
                     s.errors ? `${s.errors} conflict${s.errors > 1 ? "s" : ""}` : "No conflicts"
                 }</span>` +
                 (s.unplaced ? ` <span class="chip warn">${s.unplaced} unplaced</span>` : "") +
-                ` <span class="chip">score ${s.overall}</span>`;
+                (blocking ? "" : ` <span class="chip">score ${s.overall}</span>`);
 
             // Approximate zone sizes, so "how big is the study corner?" has an
             // answer taken from the plan itself.
@@ -208,7 +223,7 @@
                     <div class="zone-sizes">
                       <strong>Zone sizes (approx.)</strong>
                       <ul>${plan.zones.map((z) =>
-                        `<li>${esc(z.label)}: ${z.approx_width_ft} × ${z.approx_depth_ft} ft (${z.approx_area_sqft} sq ft)</li>`
+                        `<li>${esc(displayLabel(z.label))}: ${z.approx_width_ft} × ${z.approx_depth_ft} ft (${z.approx_area_sqft} sq ft)</li>`
                       ).join("")}</ul>
                     </div>`;
             }
@@ -342,20 +357,21 @@
         const box = $("refinePanel");
         if (!box) return;
         box.hidden = false;
-        if (!$("refineSuggestions").dataset.filled) {
-            $("refineSuggestions").dataset.filled = "1";
-            $("refineSuggestions").innerHTML = [
-                "Make the desk bigger", "Swap the armchair for a bean bag",
-                "Make it bluer", "Add a reading nook", "Remove the rug",
-                "Move the wardrobe next to the door",
-            ].map((s) => `<button type="button" class="chip suggest">${esc(s)}</button>`).join("");
-            $("refineSuggestions").addEventListener("click", (e) => {
-                if (e.target.classList.contains("suggest")) {
-                    $("refineInput").value = e.target.textContent;
-                    $("refineBtn").click();
-                }
-            });
-        }
+        const names = (currentDesign && currentDesign.furniture || [])
+            .map((item) => item.name).filter(Boolean);
+        const suggestions = names.slice(0, 3).flatMap((name) => [
+            `Make ${name} bigger`,
+            `Remove ${name}`,
+        ]);
+        $("refineSuggestions").innerHTML = suggestions
+            .map((s) => `<button type="button" class="chip suggest">${esc(s)}</button>`)
+            .join("");
+        $("refineSuggestions").onclick = (e) => {
+            if (e.target.classList.contains("suggest")) {
+                $("refineInput").value = e.target.textContent;
+                $("refineBtn").click();
+            }
+        };
     }
 
     // Build the same shape `renderOption` expects from a refine response, so
@@ -618,15 +634,21 @@
             ${plan.phase2 && plan.phase2.line_items && plan.phase2.line_items.length ? phase(plan.phase2) : ""}`;
     }
 
-    function renderEvaluation(evaluation, validation) {
+    function renderEvaluation(evaluation, validation, modelUsed, options) {
         if (!evaluation || !evaluation.scores) return;
         const box = $("evaluation");
         // A high score next to blocking issues is the contradiction the client
         // sees first. When the code check has blocking issues, the overall is
         // shown as "withheld" rather than as a good-looking number.
-        const blocking = ((validation && validation.violations) || [])
+        const validatorViolations = [
+            ...((validation && validation.violations) || []),
+            ...((options || []).flatMap((option) =>
+                (option.validation && option.validation.violations) || []
+            )),
+        ];
+        const blocking = validatorViolations
             .filter((v) => v.severity === "error");
-        const rows = Object.entries(evaluation.scores)
+        const rows = blocking.length ? "" : Object.entries(evaluation.scores)
             .map(([k, v]) => {
                 const pct = Math.max(0, Math.min(100, (Number(v) / 10) * 100));
                 return `
@@ -644,10 +666,19 @@
 
         // "Remaining issues", not "Issues addressed". The critic's list is
         // what is still wrong, and labelling it as fixed was exactly backwards.
-        const remaining = evaluation.remaining_issues || evaluation.issues || [];
+        const validatorIssues = blocking
+            .filter((v) => v.severity === "error")
+            .map((v) => v.message)
+            .filter((message, index, all) => all.indexOf(message) === index);
+        const remaining = validatorIssues.length
+            ? validatorIssues
+            : (evaluation.remaining_issues || evaluation.issues || []);
+        const criticLabel = modelUsed === "Rule-based mode"
+            ? "Critic Evaluation · heuristic"
+            : "Critic Evaluation";
 
         box.innerHTML = `
-            <h3>Critic Evaluation ${overall}</h3>
+            <h3>${criticLabel} ${overall}</h3>
             ${blocking.length
                 ? `<p class="muted small">${blocking.length} blocking brief-check issue(s) remain, so the score is not shown as a pass.</p>`
                 : ""}
@@ -728,7 +759,7 @@
             .map(
                 (b) => `
                 <div class="bd-row">
-                    <span>${esc(b.category)}</span>
+                    <span>${esc(displayLabel(b.category))}</span>
                     <div class="bd-bar"><div class="bd-fill" style="width:${Math.min(
                         100,
                         Number(b.percentage) || 0
@@ -759,6 +790,10 @@
 
         const dims = option.layout && option.layout.room;
         const zones = option.layout && option.layout.zones;
+        const suggestions = (option.budget_suggestions || []).map(
+            (item) => `${item.name} (${inr(item.price_inr)})`
+        );
+        const remainingBudget = option.remaining_budget_inr;
 
         return `
         <article class="option">
@@ -771,6 +806,13 @@
                         : "estimated total, summed from the list below"}</span>
                 </div>
             </div>
+            ${remainingBudget != null
+                ? `<p class="muted small">${inr(remainingBudget)} left of the budget${
+                    suggestions.length
+                        ? ` · could buy ${suggestions.map(esc).join(", ")}`
+                        : ""
+                }</p>`
+                : ""}
 
             <p class="concept">${esc(option.concept)}</p>
 
@@ -784,7 +826,7 @@
                     ${zones && zones.length
                         ? `<h4 class="sub">Zone sizes <span class="hint">approximate</span></h4>
                            <ul class="zone-list">${zones.map((z) =>
-                               `<li>${esc(z.label)}: about ${z.approx_width_ft} × ${z.approx_depth_ft} ft (${z.approx_area_sqft} sq ft)</li>`
+                               `<li>${esc(displayLabel(z.label))}: about ${z.approx_width_ft} × ${z.approx_depth_ft} ft (${z.approx_area_sqft} sq ft)</li>`
                            ).join("")}</ul>`
                         : ""}
                 </div>
@@ -834,6 +876,13 @@
         ];
         if (data.cached) parts.push("⚡ cached");
         if (data.model_used) parts.push(data.model_used);
+        if (data.options.length < (lastPayload && lastPayload.num_options || 1)) {
+            const reason = (data.rejected_options || []).join("; ");
+            parts.push(
+                `Only ${data.options.length} distinct option(s) returned` +
+                (reason ? `: ${reason}` : "")
+            );
+        }
         $("resultsMeta").innerHTML = parts.map((p) => `<span class="meta-pill">${esc(p)}</span>`).join("");
     }
 
@@ -886,7 +935,7 @@
                         renderValidation(data.validation);
                         renderBudgetPlan(data.budget_plan);
                         renderOptions(data.options || []);
-                        renderEvaluation(data.evaluation, data.validation);
+                        renderEvaluation(data.evaluation, data.validation, data.model_used, data.options);
                         renderSources(data.context_sources);
                         renderLayout(payload, data);
                         _afterResult(data, payload);
@@ -919,7 +968,7 @@
         renderValidation(data.validation);
         renderBudgetPlan(data.budget_plan);
         renderOptions(data.options || []);
-        renderEvaluation(data.evaluation, data.validation);
+        renderEvaluation(data.evaluation, data.validation, data.model_used, data.options);
         renderSources(data.context_sources);
         renderLayout(payload, data);
         _afterResult(data, payload);   // floor plan is independent of the LLM run

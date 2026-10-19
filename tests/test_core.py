@@ -7,12 +7,16 @@ These are pure and fast, with no LLM or network dependency.
 from __future__ import annotations
 
 import time
+import asyncio
+from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from app.core.config import Settings, _default_llm_providers
 from app.core.observability import MetricsRegistry
 from app.core.schemas import DesignOption, DesignRequest
+from app.core import security
 from app.core.security import RateLimiter, verify_api_key
 
 
@@ -94,6 +98,19 @@ class TestSecurity:
         assert limiter.check("ip")[0] is False
         time.sleep(1.1)
         assert limiter.check("ip")[0] is True
+
+    def test_daily_request_cap_is_enforced_per_ip(self, monkeypatch):
+        monkeypatch.setattr(security, "limiter", RateLimiter(60, 60))
+        monkeypatch.setattr(security, "daily_limiter", RateLimiter(1, 86400))
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="198.51.100.8"),
+            url=SimpleNamespace(path="/api/v1/generate"),
+        )
+        asyncio.run(security.rate_limit(request))
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(security.rate_limit(request))
+        assert exc.value.status_code == 429
+        assert "Daily request limit" in exc.value.detail
 
 
 class TestMetrics:

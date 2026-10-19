@@ -1,8 +1,13 @@
 # InteriorAI
 
-An agentic interior design platform for the Indian market. Takes a client's
-brief, retrieves domain knowledge, runs a multi-agent LLM pipeline, and returns
-costed design proposals with a measured floor plan.
+**Turn an Indian home-design brief into catalog-priced room options, a measured
+floor plan, rule-checked Vastu notes, and a client-ready PDF.**
+
+Live demo: <https://interiorai-vaa8.onrender.com/>. The public demo is
+keyless and uses rule-based catalog mode; it does not claim to be LLM-generated.
+The interactive UI is also a better live walkthrough than a prerecorded clip.
+**Demo media placeholder:** add a 30-60 second GIF here after capturing a
+representative run. Add current UI screenshots alongside it when available.
 
 **The core principle: language models write, code decides.** The LLM chooses
 furniture and writes prose. Python does every calculation, every constraint
@@ -22,7 +27,7 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 Open http://localhost:8001 · API docs at `/docs`
 
 ```bash
-./venv/bin/python -m pytest        # 330 tests, ~4s, fully offline
+./venv/bin/python -m pytest        # fully offline regression suite
 ```
 
 Ollama is optional. Without it the pipeline returns a catalog-driven fallback
@@ -60,6 +65,24 @@ PDF client proposal.
    ├──▶ VastuEngine   (rule-based, per-rule score + remedy)
    └──▶ Refine / PDF  (targeted edits, client proposal)
 ```
+
+## How it works
+
+- **Retrieval (RAG):** hybrid BM25 and dense retrieval feed room- and
+  style-filtered design guidance to the agents. General, untagged guidance is
+  still eligible; passages tagged for a different selected style are not.
+- **Validation:** deterministic checks verify selected products, room
+  suitability, special requirements, color scheme, budget, dimensions, and
+  directional rules. Blocking failures are shown instead of a green score.
+- **Reflection:** the pipeline ranks attempts by validation and critic score,
+  keeps the best attempt, and stops once blocking checks pass. In catalog mode
+  it applies deterministic repairs and re-validates rather than retrying a
+  missing model.
+- **Semantic cache:** normalized briefs are compared with a conservative
+  similarity threshold to avoid serving a different client's design.
+- **Observability:** structured logs, request latency, provider metrics, cache
+  counters, and retrieval coverage are exposed through the evaluation and
+  Prometheus endpoints.
 
 ### The division of labour
 
@@ -107,7 +130,7 @@ app/
   services/     LLM providers, hybrid RAG, BM25, cache, evaluation, proposal (PDF)
   api/          FastAPI routes
 static/         layout.js (2D SVG), layout3d.js (three.js), app.js
-tests/          330 tests
+tests/          unit and integration regression suite
 ```
 
 ---
@@ -168,11 +191,10 @@ bigger" as a full redesign is the exact failure the feature exists to prevent,
 so an unrecognised request returns "I could not tell which part to change"
 rather than guessing.
 
-**Graceful degradation.** When the LLM fails or returns unusable JSON, the
-architect falls back to a catalog-driven design: real SKUs, correct prices,
-brief-compliant counts, honest prose that admits it is generic. The original
-stub returned empty furniture and the literal string "Layout derived from the
-design plan", so a 90-second request ended in a ₹0 design.
+**Graceful degradation.** When no provider is configured, the app explicitly
+reports **Rule-based mode** and builds designs from catalog SKUs, prices,
+structured form data, and deterministic layout/rule code. A configured but
+unavailable provider is not represented as a successful model call.
 
 ---
 
@@ -189,19 +211,45 @@ design plan", so a 90-second request ended in a ₹0 design.
   scores sit low by design. BM25 is what carries exact-term recall. Add
   `sentence-transformers` and set `EMBEDDING_BACKEND` to improve paraphrase
   matching.
-- **Latency is dominated by the LLM** (~60-90s for a full run on gemma2:2b).
-  The layout endpoint is code-only and returns in milliseconds.
-- **No rendered imagery or photo analysis.** Both need an external vision or
-  image API and the corresponding API key; neither is wired up.
-- **The 3D view is a viewer, not a photorealistic renderer** — boxes, walls,
-  and directional lighting.
+- **The product catalog is small and curated.** Prices are indicative
+  snapshots, not live availability or retailer quotes.
+- **Keyless public mode is rule-based.** Prose and option diversity are more
+  constrained than with a configured hosted model; heuristic scores are not
+  human design evaluations.
+- **No photorealistic room rendering, photo analysis, or image redesign.**
+  The 2D plan and simple 3D viewer are geometric visualizations, not
+  construction drawings or rendered interiors.
+- **Rate limits are in-memory per process.** The rolling per-IP minute and
+  daily ceilings protect the single-worker public demo but are not a
+  distributed abuse-prevention system.
+
+## Evaluation
+
+The following one-run evaluation used the deterministic keyless catalog
+pipeline with eight room briefs. All returned options passed blocking
+validation (8/8 briefs); the request for three options produced two distinct
+options on seven briefs, and the UI reports when a near-duplicate was removed.
+Average first-option catalog total was ₹9,606, model cost was ₹0, and mean
+end-to-end latency was 18 ms. This is a regression check of rule-based
+behavior, not a human evaluation of design quality.
+
+| # | Room | Style / constraints | Valid options (returned / requested) | Catalog total(s) | Latency |
+|---|---|---|---|---:|---:|
+| 1 | Living room | Modern, Warm Earthy, family / kids-safe | 2/2 (2/2) | ₹17,450; ₹18,150 | 48 ms |
+| 2 | Kitchen | Modern, strict Vastu, ventilation | 2/2 (2/3) | ₹17,900; ₹21,950 | 6 ms |
+| 3 | Bedroom | Minimalist, storage, budget | 2/2 (2/3) | ₹2,900; ₹6,950 | 23 ms |
+| 4 | Kids room | Scandinavian, kids-safe | 2/2 (2/3) | ₹14,500; ₹18,550 | 6 ms |
+| 5 | Home office | Modern, workstation | 2/2 (2/3) | ₹11,700; ₹15,750 | 23 ms |
+| 6 | Dining | Modern, family | 2/2 (2/3) | ₹7,200; ₹11,250 | 5 ms |
+| 7 | Balcony | Bohemian, compact | 2/2 (2/3) | ₹1,600; ₹5,650 | 12 ms |
+| 8 | Entrance | Minimalist, shoe storage | 2/2 (2/3) | ₹3,600; ₹7,650 | 24 ms |
 
 ---
 
 ## Testing
 
 ```bash
-./venv/bin/python -m pytest              # 330 tests
+./venv/bin/python -m pytest              # full suite
 ./venv/bin/python -m pytest tests/test_engine.py -v
 ```
 
@@ -210,6 +258,10 @@ hashing, and placement is pure geometry. The tests assert invariants rather
 than snapshots — no footprint leaves the room, no two overlap, every pair
 respects clearance, every total equals the sum of its lines — so they fail on
 real regressions rather than on refactors.
+
+## License
+
+This project is available under the [MIT License](./LICENSE).
 
 ## Cloud deployment
 

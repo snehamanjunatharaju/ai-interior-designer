@@ -276,6 +276,8 @@ class DesignOption(BaseModel):
     storage_strategy: str = ""
     decor_suggestions: List[str] = Field(default_factory=list)
     estimated_cost_inr: int = 0
+    remaining_budget_inr: Optional[int] = None
+    budget_suggestions: List[Dict[str, Any]] = Field(default_factory=list)
     budget_breakdown: List[BudgetBreakdown] = Field(default_factory=list)
     # Vastu notes are generated from the rule-check results, never from model
     # prose, so a note cannot claim compliance the code check contradicts.

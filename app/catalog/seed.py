@@ -41,7 +41,9 @@ CATEGORY_ROOMS: dict[str, tuple[str, ...]] = {
     "chair": ("kids_room", "home_office", "dining", "bedroom"),
     "wardrobe": ("bedroom", "kids_room"),
     "tv_unit": ("living_room", "bedroom"),
-    "storage": ("bedroom", "kids_room", "home_office", "living_room", "kitchen"),
+    "storage": (
+        "bedroom", "kids_room", "home_office", "living_room", "kitchen", "entrance",
+    ),
     "seating": ("living_room", "balcony", "bedroom", "kids_room"),
     "table": ("living_room", "dining", "bedroom", "home_office"),
     "kitchen": ("kitchen", "dining"),
@@ -172,6 +174,12 @@ SEED_ITEMS: list[CatalogItem] = [
         "STO-SHLF-01", "Floating Wall Shelf 90cm", "storage", "Hometown",
         1300, 90, 20, 25, TIER_ESSENTIAL,
         "https://www.hometownfurniture.com/",
+    ),
+    CatalogItem(
+        "SHR-ITSY-3T-01", "Nilkamal Itsy 3-Tier Shoe Rack", "storage", "Nilkamal",
+        1700, 50, 28, 61, TIER_ESSENTIAL,
+        "https://www.nilkamalfurniture.com/products/nilkamal-itsy-3-tier-shoe-rack",
+        "Indicative listed price checked 2026-10-20; dimensions are typical assembled estimate",
     ),
 
     # ======================================================================
