@@ -80,6 +80,43 @@ class TestNoKeysRequired:
         assert report.is_valid, [v.to_dict() for v in report.errors]
         assert fallback["cons"], "the fallback must admit its own limits"
 
+    @pytest.mark.asyncio
+    async def test_full_generation_returns_a_priced_strict_kitchen_without_provider(
+        self, monkeypatch
+    ):
+        from app.agents.orchestrator import design_pipeline
+        from app.core.schemas import DesignRequest as DR
+        from app.services.llm_provider import registry
+
+        async def unavailable(*args, **kwargs):
+            raise RuntimeError("No LLM providers configured")
+
+        monkeypatch.setattr(registry, "complete_json", unavailable)
+        response = await design_pipeline.generate(
+            DR(
+                client_preferences="A practical family kitchen with storage",
+                room_type="kitchen",
+                room_dimensions="9 x 11 ft",
+                color_scheme="warm",
+                vastu_compliance="strict",
+                budget_amount_inr=150_000,
+                num_options=1,
+            )
+        )
+
+        option = response.options[0]
+        assert option.furniture
+        assert all(item.sku for item in option.furniture)
+        assert option.estimated_cost_inr > 0
+        assert option.layout["room"]["width_ft"] == 9
+        cooking = next(
+            result for result in option.vastu_results
+            if result["code"] == "cook_south_east"
+        )
+        assert cooking["passed"]
+        assert "south-east" in cooking["explanation"]
+        assert "east" in cooking["explanation"]
+
     def test_budget_negotiator_needs_no_llm(self):
         cost = price_design(
             {"furniture": [

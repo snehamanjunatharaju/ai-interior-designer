@@ -1008,7 +1008,15 @@
                 .map(([name, p]) => name + " · " + p.model);
 
             const badge = $("providerBadge");
-            badge.textContent = up.length ? up.join(" | ") : "no provider available";
+            const configuredProviders = Object.keys(data.providers || {}).length;
+            badge.textContent = up.length
+                ? up.join(" | ")
+                : configuredProviders
+                    ? "AI unavailable · catalog fallback"
+                    : "catalog mode · no AI key";
+            badge.title = up.length
+                ? "AI-generated design prose is available."
+                : "Catalog-based designs, prices, layout, Vastu checks, and PDFs work without an AI provider.";
             badge.className = "badge " + (up.length ? "badge-ok" : "badge-warn");
 
             const hb = $("healthBadge");

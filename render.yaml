@@ -2,7 +2,7 @@ services:
   - type: web
     name: interiorai
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/v1/health
@@ -15,7 +15,3 @@ services:
         value: "false"
       - key: LLM_PROVIDERS
         value: openai,anthropic
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: ANTHROPIC_API_KEY
-        sync: false

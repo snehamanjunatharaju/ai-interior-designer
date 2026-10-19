@@ -220,12 +220,18 @@ without rewriting the UI. Connect the GitHub repository to Render and deploy
 the included `render.yaml` Blueprint. The app serves its existing UI at `/`
 and its API under `/api/v1`.
 
-Ollama is local to its host and is not reachable from Render or Vercel. The
-Render Blueprint selects the hosted OpenAI and Anthropic providers. Enter at
-least one provider key into Render's secret environment settings when prompted;
-never put a live key in this repository or a checked-in `.env` file. Production
-defaults to hosted providers; development remains local-first.
+The included Blueprint uses Render's free web-service plan and needs no
+provider key to start. Ollama is local to your computer and is not reachable
+from Render. Without a hosted LLM key, the app uses its catalog-driven fallback:
+it still returns real catalog items and prices, a computed layout and Vastu
+checks, and PDF proposals, but the design prose is generic rather than
+LLM-written. To enable AI-generated design prose later, add an OpenAI or
+Anthropic key as a Render secret; never put a live key in this repository.
 
-Before deploying, configure a hard usage/spending limit and billing alert in
-the provider account dashboard. The application can estimate token costs but
-cannot create or enforce account-level provider limits.
+Render's free web services spin down after 15 minutes without traffic and can
+take about a minute to wake up. They have limited monthly usage and ephemeral
+storage, so this configuration is for a public demo, not a production service.
+The application catalog is seeded from source and does not rely on persistent
+local storage. If you later add a paid provider key, set a spending limit and
+billing alert in that provider's dashboard; the app cannot enforce account
+limits.
